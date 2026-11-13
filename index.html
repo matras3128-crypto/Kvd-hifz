@@ -3277,6 +3277,269 @@ document.addEventListener("dragend", () => { ui.dragId = null; $$(".dragging,.dr
    ========================================================== */
 applyTheme();
 initCloud();
+   /* ==========================================================
+   ЧАТ КОМАНДЫ — самодостаточный блок
+   Вставить в самый низ <script>, перед </script>
+   ========================================================== */
+window.HFZ_CHAT = window.HFZ_CHAT || {
+  messages: [], members: [], bans: [], sending: false, channel: null, watch: null,
+};
+
+async function loadChatData() {
+  if (!isStaff()) return;
+  const [m, mem] = await Promise.all([
+    client.from("hifz_messages").select("*").order("created_at", { ascending: true }).limit(300),
+    client.from("hifz_members").select("*").order("created_at"),
+  ]);
+  if (m.error) throw m.error;
+  if (mem.error) throw mem.error;
+  HFZ_CHAT.messages = m.data || [];
+  HFZ_CHAT.members = mem.data || [];
+  if (isOwner()) {
+    const { data, error } = await client.from("hifz_bans").select("*").order("kicked_at", { ascending: false });
+    if (error) throw error;
+    HFZ_CHAT.bans = data || [];
+  } else {
+    HFZ_CHAT.bans = [];
+  }
+}
+
+function canKick(t) {
+  if (!isStaff() || !t || t.user_id === member.user_id) return false;
+  if (t.role === "owner") return false;
+  if (isOwner()) return true;
+  return t.role === "student";
+}
+
+function chatTime(ts) {
+  const d = new Date(ts);
+  const day = dstr(d);
+  const t = today();
+  if (day === t) return fmtTime.format(d);
+  if (day === addD(t, -1)) return "вчера " + fmtTime.format(d);
+  return fmtDay.format(d) + " " + fmtTime.format(d);
+}
+
+function renderChatMessages() {
+  const wrap = $("#chatMessages");
+  if (!wrap) return;
+  if (!HFZ_CHAT.messages.length) {
+    wrap.innerHTML = `<div class="chat-empty">${icon("chat", 30)}<p>Сообщений пока нет.<br>Напишите первое — его увидят только учителя и владелец.</p></div>`;
+    return;
+  }
+  wrap.innerHTML = HFZ_CHAT.messages.map((m) => {
+    const mine = m.user_id === member.user_id;
+    return `<article class="chat-msg ${mine ? "mine" : ""}" data-mid="${m.id}">
+      <span class="avatar sm">${esc(initials(m.author_name))}</span>
+      <div class="chat-bubble">
+        <header>
+          <b>${esc(m.author_name)}</b>${roleBadge(m.author_role)}
+          <time>${chatTime(m.created_at)}</time>
+          <button class="chat-del" data-action="chat-delete" data-id="${m.id}" title="Удалить сообщение">${icon("trash", 12)}</button>
+        </header>
+        <p>${esc(m.body).replace(/\n/g, "<br>")}</p>
+      </div>
+    </article>`;
+  }).join("");
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderChatMembers() {
+  const wrap = $("#chatMembers");
+  if (!wrap) return;
+  wrap.innerHTML = HFZ_CHAT.members.map((t) => {
+    const linked = t.student_id ? byId(t.student_id) : null;
+    return `<div class="chat-member">
+      <span class="avatar sm">${esc(initials(t.name || t.email))}</span>
+      <div class="cm-info">
+        <b>${esc(t.name || "Участник")}</b>
+        <span>${roleLabel(t.role)}${linked ? " · " + esc(linked.name) : ""}</span>
+      </div>
+      ${canKick(t) ? `<button class="icon-btn cm-kick" data-action="kick-member" data-id="${t.user_id}" title="Исключить">${icon("kick", 13)}</button>` : ""}
+    </div>`;
+  }).join("");
+
+  const bw = $("#chatBans");
+  if (bw) {
+    bw.innerHTML = HFZ_CHAT.bans.length
+      ? HFZ_CHAT.bans.map((b) => `<div class="chat-member banned">
+          <span class="avatar sm">${esc(initials(b.name || b.email))}</span>
+          <div class="cm-info">
+            <b>${esc(b.name || b.email || "—")}</b>
+            <span>${b.reason ? esc(b.reason) : "без причины"} · ${fmtDay.format(new Date(b.kicked_at))}</span>
+          </div>
+          <button class="btn soft sm" data-action="unban-member" data-id="${b.user_id}">Вернуть</button>
+        </div>`).join("")
+      : `<div class="empty-list" style="padding:12px">Никого не исключали.</div>`;
+  }
+}
+
+function renderChat() {
+  renderChatMessages();
+  renderChatMembers();
+}
+
+function viewChat() {
+  if (!isStaff()) return emptyBlock("Только для команды", "Чат доступен владельцу и учителям.");
+  return `<div class="page-head reveal">
+      <div>
+        <h1>Чат команды<span class="count-pill">${HFZ_CHAT.members.length}</span></h1>
+        <p class="sub">Видят только владелец и учителя</p>
+      </div>
+      <button class="btn soft" data-action="chat-refresh">${icon("refresh", 15)} Обновить</button>
+    </div>
+    <div class="chat-grid">
+      <section class="card chat-card reveal" style="--i:1">
+        <div id="chatMessages" class="chat-messages"></div>
+        <form id="chatForm" class="chat-form">
+          <input name="body" maxlength="2000" placeholder="Сообщение команде…" autocomplete="off" required>
+          <button class="btn primary" type="submit" title="Отправить">${icon("send", 15)}</button>
+        </form>
+      </section>
+      <aside class="card chat-side reveal" style="--i:2">
+        <h2>Участники</h2>
+        <div id="chatMembers" class="chat-members"></div>
+        ${isOwner() ? `<div class="drawer-section"><h4>Исключённые</h4><div id="chatBans"></div></div>` : ""}
+      </aside>
+    </div>`;
+}
+
+function openKickModal(id) {
+  const t = HFZ_CHAT.members.find((x) => x.user_id === id);
+  if (!t || !canKick(t)) return;
+  openModal(`<h3>Исключить участника?</h3>
+    <p><b>${esc(t.name || t.email)}</b> (${roleLabel(t.role)}) потеряет доступ к журналу и не сможет войти снова, пока владелец не вернёт его.</p>
+    <form id="kickForm" data-id="${t.user_id}">
+      <label class="field">Причина<input name="reason" maxlength="120" placeholder="Необязательно"></label>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="modal-close">Отмена</button>
+        <button class="btn danger" type="submit">${icon("kick", 14)} Исключить</button>
+      </div>
+    </form>`);
+}
+
+async function sendChat(body) {
+  const text = String(body || "").trim();
+  if (!text || HFZ_CHAT.sending || !isStaff()) return;
+  HFZ_CHAT.sending = true;
+  try {
+    const { error } = await client.from("hifz_messages").insert({
+      user_id: member.user_id,
+      author_name: member.name || "Участник",
+      author_role: member.role,
+      body: text,
+    });
+    if (error) throw error;
+    await loadChatData();
+    renderChat();
+    Sound.play("save");
+  } finally {
+    HFZ_CHAT.sending = false;
+  }
+}
+
+async function deleteChatMessage(id) {
+  const { error } = await client.from("hifz_messages").delete().eq("id", id);
+  if (error) throw error;
+  HFZ_CHAT.messages = HFZ_CHAT.messages.filter((m) => m.id !== id);
+  renderChatMessages();
+  toast("Сообщение удалено", { type: "info" });
+}
+
+async function kickMember(id, reason) {
+  const { error } = await rpc("hifz_kick_member", { target: id, reason: reason || null });
+  if (error) throw error;
+  await loadChatData();
+  renderChat();
+  toast("Участник исключён", { type: "info" });
+  Sound.play("undo");
+}
+
+async function unbanMember(id) {
+  const { error } = await rpc("hifz_unban_member", { target: id });
+  if (error) throw error;
+  await loadChatData();
+  renderChat();
+  toast("Доступ возвращён — участник сможет войти снова");
+}
+
+/* перекрываем подписки, чтобы чат и кик приходили живьём */
+function subscribeCloud() {
+  unsubscribeCloud();
+  if (!client || !member) return;
+  try {
+    if (isStaff()) {
+      channel = client.channel("hifz-workspace")
+        .on("postgres_changes", { event: "UPDATE", schema: "public", table: "hifz_workspace", filter: "id=eq.1" }, (p) => {
+          if (p.new?.rev > sync.rev && !sync.dirty) pullState().catch(() => {});
+        }).subscribe();
+
+      HFZ_CHAT.channel = client.channel("hifz-chat")
+        .on("postgres_changes", { event: "*", schema: "public", table: "hifz_messages" }, () => {
+          loadChatData().then(() => { if (ui.view === "chat") renderChat(); }).catch(() => {});
+        }).subscribe();
+    }
+
+    reqChannel = client.channel("hifz-requests")
+      .on("postgres_changes", { event: "*", schema: "public", table: "hifz_requests" }, () => loadRequests().then(renderAll).catch(() => {}))
+      .subscribe();
+
+    HFZ_CHAT.watch = client.channel("hifz-member-watch")
+      .on("postgres_changes", { event: "DELETE", schema: "public", table: "hifz_members", filter: "user_id=eq." + member.user_id }, () => {
+        toast("Вас исключили из журнала", { type: "danger", duration: 8000 });
+        setTimeout(() => client.auth.signOut(), 1200);
+      }).subscribe();
+  } catch (e) {}
+}
+
+function unsubscribeCloud() {
+  if (channel) { try { client.removeChannel(channel); } catch (e) {} channel = null; }
+  if (reqChannel) { try { client.removeChannel(reqChannel); } catch (e) {} reqChannel = null; }
+  if (HFZ_CHAT.channel) { try { client.removeChannel(HFZ_CHAT.channel); } catch (e) {} HFZ_CHAT.channel = null; }
+  if (HFZ_CHAT.watch) { try { client.removeChannel(HFZ_CHAT.watch); } catch (e) {} HFZ_CHAT.watch = null; }
+}
+
+/* обработчики чата — работают независимо от того, добавлены шаги 12–13 или нет */
+document.addEventListener("click", async (e) => {
+  const t = e.target.closest("[data-action]");
+  if (!t) return;
+  const a = t.dataset.action;
+  if (!["chat-refresh", "chat-delete", "kick-member", "unban-member"].includes(a)) return;
+  e.stopPropagation();
+  e.preventDefault();
+  try {
+    if (a === "chat-refresh") { await loadChatData(); renderChat(); }
+    if (a === "chat-delete") { await deleteChatMessage(t.dataset.id); }
+    if (a === "kick-member") { openKickModal(t.dataset.id); }
+    if (a === "unban-member") { await unbanMember(t.dataset.id); }
+  } catch (err) {
+    toast(humanError(err), { type: "danger" });
+    Sound.play("err");
+  }
+}, true);
+
+document.addEventListener("submit", async (e) => {
+  const f = e.target;
+  if (f.id !== "chatForm" && f.id !== "kickForm") return;
+  e.stopPropagation();
+  e.preventDefault();
+  try {
+    if (f.id === "chatForm") {
+      const val = f.elements.body.value;
+      f.elements.body.value = "";
+      await sendChat(val);
+      $("#chatForm input")?.focus();
+    } else {
+      const reason = f.elements.reason.value.trim();
+      const target = f.dataset.id;
+      closeModal();
+      await kickMember(target, reason);
+    }
+  } catch (err) {
+    toast(humanError(err), { type: "danger" });
+    Sound.play("err");
+  }
+}, true);
 </script>
 </body>
    </html>
