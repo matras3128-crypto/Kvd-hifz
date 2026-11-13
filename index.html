@@ -3140,7 +3140,14 @@ document.addEventListener("submit", async (e) => {
 });
           if (error) throw error;
           if (data.session) await enterCloud(data.session);
-          else toast("Подтвердите почту, затем войдите", { type: "info", duration: 7000 });
+          else {
+            const { data: d2, error: e2 } = await client.auth.signInWithPassword({
+              email: F.email.value.trim(),
+              password: F.password.value,
+            });
+            if (e2) throw e2;
+            if (d2.session) await enterCloud(d2.session);
+          }
         } else {
           const { data, error } = await client.auth.signInWithPassword({ email: F.email.value.trim(), password: F.password.value });
           if (error) throw error;
