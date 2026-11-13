@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#f4f8fd" />
 <title>Журнал хифза</title>
+<link rel="icon" type="image/png" href="logo.png" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Amiri:wght@400;700&display=swap" rel="stylesheet" />
@@ -1761,6 +1762,21 @@ label {
   }
   html { scroll-behavior: auto; }
 }
+.brand-mark {
+  position: relative;
+  overflow: hidden;
+}
+.brand-mark img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.brand-mark img ~ .brand-fallback {
+  display: none;
+}
 </style>
 </head>
 <body>
@@ -1771,13 +1787,14 @@ label {
 <header class="topbar">
   <div class="topbar-inner">
     <div class="brand" data-action="home" title="На главную">
-      <span class="brand-mark">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-          <path d="M9 7h7M9 11h5" />
-        </svg>
-      </span>
+<span class="brand-mark" id="brandMark">
+  <img src="logo.png" alt="Логотип" draggable="false" onerror="this.remove()" />
+  <svg class="brand-fallback" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+    <path d="M9 7h7M9 11h5" />
+  </svg>
+</span>
       <span><b>Журнал хифза</b><small>by Synthetix Lab (kosh) with KoranVdom</small></span>
     </div>
     <nav class="tabs" id="tabs"></nav>
