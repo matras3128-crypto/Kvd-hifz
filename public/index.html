@@ -4006,5 +4006,883 @@ initCloud();
   }
 })();
 </script>
+<script>
+/* ==========================================================
+   HIFZ CHAT UNREAD BADGE
+   Вставь ПОСЛЕ хотфикса чата и ПЕРЕД </body>.
+   Считает непрочитанные сообщения и показывает цифру на вкладке «Чат».
+   ========================================================== */
+(function () {
+  if (window.__hifzUnreadInstalled) return;
+  window.__hifzUnreadInstalled = true;
+
+  var BASE_TITLE = (document.title || "Журнал хифза").replace(/^\(\d+\+?\)\s*/, "");
+  var lastFocusLoad = 0;
+
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function view() { try { return typeof ui !== "undefined" ? ui.view : ""; } catch (e) { return ""; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+  function list() {
+    try { return (typeof chatMessages !== "undefined" && Array.isArray(chatMessages)) ? chatMessages : []; }
+    catch (e) { return []; }
+  }
+  function readKey() { var m = mem(); return "hifz-chat-read-" + (m && m.user_id ? m.user_id : "anon"); }
+
+  function getLastRead() {
+    try { return Number(localStorage.getItem(readKey()) || 0); } catch (e) { return 0; }
+  }
+  function setLastRead(ts) {
+    try { localStorage.setItem(readKey(), String(ts)); } catch (e) {}
+  }
+
+  function countUnread() {
+    var m = mem();
+    if (!staff() || !m) return 0;
+    var last = getLastRead();
+    var n = 0;
+    var arr = list();
+    for (var i = 0; i < arr.length; i++) {
+      var msg = arr[i];
+      if (msg.user_id === m.user_id) continue;
+      if (new Date(msg.created_at).getTime() > last) n++;
+    }
+    return n;
+  }
+
+  function paint() {
+    var tab = document.querySelector('#tabs [data-action="nav"][data-view="chat"]');
+    if (!tab) return;
+    var n = window.__hifzUnread || 0;
+    var b = tab.querySelector(".chat-badge");
+    if (!n) {
+      if (b) b.remove();
+      tab.classList.remove("has-unread");
+      return;
+    }
+    if (!b) {
+      b = document.createElement("span");
+      b.className = "tab-badge chat-badge";
+      tab.appendChild(b);
+    }
+    tab.classList.add("has-unread");
+    var text = n > 99 ? "99+" : String(n);
+    if (b.textContent !== text) {
+      b.textContent = text;
+      b.classList.remove("pop");
+      void b.offsetWidth;
+      b.classList.add("pop");
+    }
+  }
+
+  function title() {
+    var n = window.__hifzUnread || 0;
+    document.title = n ? "(" + (n > 99 ? "99+" : n) + ") " + BASE_TITLE : BASE_TITLE;
+  }
+
+  function markRead() {
+    var ts = Date.now();
+    var arr = list();
+    for (var i = 0; i < arr.length; i++) {
+      var t = new Date(arr[i].created_at).getTime();
+      if (t > ts) ts = t;
+    }
+    setLastRead(ts);
+    window.__hifzUnread = 0;
+    paint();
+    title();
+  }
+
+  function ping() {
+    try {
+      if (typeof prefs !== "undefined" && !prefs.sound) return;
+      if (typeof Sound === "undefined") return;
+      Sound.ensure();
+      if (!Sound.ctx) return;
+      var t = Sound.ctx.currentTime;
+      Sound.tone(880, t, 0.09, 0.04);
+      Sound.tone(1174.7, t + 0.075, 0.13, 0.035);
+    } catch (e) {}
+  }
+
+  function refresh(notify) {
+    var prev = window.__hifzUnread || 0;
+    if (view() === "chat") { markRead(); return; }
+    var n = countUnread();
+    window.__hifzUnread = n;
+    paint();
+    title();
+    if (notify && n > prev) ping();
+  }
+
+  /* --- оборачиваем существующие функции --- */
+
+  if (typeof window.renderHeader === "function") {
+    var _renderHeader = window.renderHeader;
+    window.renderHeader = function () {
+      var r = _renderHeader.apply(this, arguments);
+      paint();
+      return r;
+    };
+  }
+
+  if (typeof window.renderView === "function") {
+    var _renderView = window.renderView;
+    window.renderView = function () {
+      var r = _renderView.apply(this, arguments);
+      if (view() === "chat") markRead();
+      return r;
+    };
+  }
+
+  if (typeof window.go === "function") {
+    var _go = window.go;
+    window.go = function (v, id) {
+      var r = _go.apply(this, arguments);
+      if (v === "chat") setTimeout(markRead, 60);
+      return r;
+    };
+  }
+
+  if (typeof window.loadChatData === "function") {
+    var _loadChatData = window.loadChatData;
+    window.loadChatData = async function () {
+      var r = await _loadChatData.apply(this, arguments);
+      refresh(true);
+      return r;
+    };
+  }
+
+  /* --- запасной опрос при возврате на вкладку --- */
+  window.addEventListener("focus", function () {
+    if (view() === "chat") { markRead(); return; }
+    var now = Date.now();
+    if (now - lastFocusLoad < 5000) { refresh(false); return; }
+    lastFocusLoad = now;
+    if (staff() && typeof window.loadChatData === "function") {
+      window.loadChatData().catch(function () {});
+    } else {
+      refresh(false);
+    }
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && view() === "chat") markRead();
+  });
+
+  /* --- стили бейджа --- */
+  if (!document.getElementById("hifz-unread-css")) {
+    var st = document.createElement("style");
+    st.id = "hifz-unread-css";
+    st.textContent = [
+      '.tab-badge.chat-badge{',
+      '  background:linear-gradient(135deg,var(--violet),var(--blue));',
+      '  color:#fff;box-shadow:0 2px 10px rgba(106,90,224,.5);',
+      '  min-width:19px;height:19px;padding:0 6px;font-size:10.5px;',
+      '}',
+      '.tab-badge.chat-badge.pop{animation:chatBadgePop .5s cubic-bezier(.2,.7,.3,1.5)}',
+      '@keyframes chatBadgePop{0%{transform:scale(.3)}55%{transform:scale(1.3)}100%{transform:scale(1)}}',
+      '.tab.has-unread{color:var(--ink);font-weight:800}',
+      '[data-theme="dark"] .tab.has-unread{color:var(--blue3)}'
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  window.__hifzUnread = countUnread();
+  paint();
+  title();
+  setTimeout(function () { refresh(false); }, 1200);
+})();
+</script>
+<script>
+/* ==========================================================
+   HIFZ CHAT PLUS
+   Вставь ПОСЛЕ всех предыдущих чат-хотфиксов и ПЕРЕД </body>.
+   Группы, личные сообщения, фото.
+   ========================================================== */
+(function () {
+  if (window.__hifzChatPlus) return;
+  window.__hifzChatPlus = true;
+
+  var S = {
+    conversations: [],
+    messages: [],
+    active: null,
+    members: [],
+    uploading: false
+  };
+
+  var cvMsgChannel = null;
+  var cvMemberChannel = null;
+  var cvConvChannel = null;
+  var BASE_TITLE = (document.title || "Журнал хифза").replace(/^\(\d+\+?\)\s*/, "");
+
+  function safeStaff() {
+    try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; }
+  }
+
+  function convName(c) {
+    if (!c) return "Чат";
+    if (c.is_general) return "Общий чат";
+    if (c.kind === "direct") {
+      var other = (c.members || []).find(function (m) { return member && m.user_id !== member.user_id; });
+      return other ? other.name : "Личный чат";
+    }
+    return c.name || "Группа";
+  }
+
+  function convInitials(c) {
+    return initials(convName(c));
+  }
+
+  function convPreview(c) {
+    var lm = c.last_message;
+    if (!lm) return "Нет сообщений";
+    if (lm.image_url) return "📷 Фото";
+    return lm.body || "";
+  }
+
+  function totalUnread() {
+    return S.conversations.reduce(function (a, c) {
+      if (c.id === S.active) return a;
+      return a + Number(c.unread || 0);
+    }, 0);
+  }
+
+  function paintBadge() {
+    var tab = document.querySelector('#tabs [data-action="nav"][data-view="chat"]');
+    if (!tab) return;
+    var n = totalUnread();
+    var b = tab.querySelector(".chat-badge");
+    if (!n) {
+      if (b) b.remove();
+      tab.classList.remove("has-unread");
+      return;
+    }
+    if (!b) {
+      b = document.createElement("span");
+      b.className = "tab-badge chat-badge";
+      tab.appendChild(b);
+    }
+    tab.classList.add("has-unread");
+    b.textContent = n > 99 ? "99+" : String(n);
+  }
+
+  function refreshBadge() {
+    window.__hifzUnread = totalUnread();
+    if (typeof renderHeader === "function") renderHeader();
+    paintBadge();
+    var n = totalUnread();
+    document.title = n ? "(" + (n > 99 ? "99+" : n) + ") " + BASE_TITLE : BASE_TITLE;
+  }
+
+  async function fetchConversations() {
+    var res = await rpc("hifz_list_conversations");
+    if (res.error) throw res.error;
+    S.conversations = res.data || [];
+  }
+
+  async function fetchMessages(id) {
+    var res = await rpc("hifz_get_conversation_messages", { p_conversation: id, p_limit: 200 });
+    if (res.error) throw res.error;
+    S.messages = res.data || [];
+  }
+
+  async function markRead(id) {
+    if (!id) return;
+    await rpc("hifz_mark_conversation_read", { p_conversation: id });
+    var c = S.conversations.find(function (x) { return x.id === id; });
+    if (c) c.unread = 0;
+    refreshBadge();
+  }
+
+  window.loadChatData = async function () {
+    if (!safeStaff()) return;
+
+    await rpc("hifz_ensure_general_conversation");
+
+    var memRes = await client.from("hifz_members").select("*").order("created_at");
+    if (memRes.error) throw memRes.error;
+    S.members = memRes.data || [];
+
+    await fetchConversations();
+
+    if (!S.active || !S.conversations.some(function (c) { return c.id === S.active; })) {
+      var general = S.conversations.find(function (c) { return c.is_general; }) || S.conversations[0];
+      S.active = general ? general.id : null;
+    }
+
+    if (S.active) {
+      await fetchMessages(S.active);
+      await markRead(S.active);
+    } else {
+      S.messages = [];
+    }
+
+    refreshBadge();
+  };
+
+  function renderConversationList() {
+    var wrap = $("#cvConversations");
+    if (!wrap) return;
+
+    if (!S.conversations.length) {
+      wrap.innerHTML = '<div class="empty-list" style="padding:18px">Диалогов пока нет.</div>';
+      return;
+    }
+
+    wrap.innerHTML = S.conversations.map(function (c) {
+      var active = c.id === S.active;
+      var unread = Number(c.unread || 0);
+      return '<button class="cv-item ' + (active ? "active" : "") + '" data-action="cv-select" data-id="' + c.id + '">' +
+        '<span class="avatar sm">' + esc(convInitials(c)) + '</span>' +
+        '<span class="cv-item-main">' +
+          '<b>' + esc(convName(c)) + '</b>' +
+          '<small>' + esc(convPreview(c)).slice(0, 60) + '</small>' +
+        '</span>' +
+        (unread ? '<span class="cv-unread">' + (unread > 99 ? "99+" : unread) + '</span>' : "") +
+      '</button>';
+    }).join("");
+  }
+
+  function messageHTML(m) {
+    var mine = member && m.user_id === member.user_id;
+    var canDelete = mine || (typeof isOwner === "function" && isOwner());
+    var body = m.body ? '<p>' + esc(m.body).replace(/\n/g, "<br>") + '</p>' : "";
+    var image = m.image_url
+      ? '<img class="cv-photo" src="' + esc(m.image_url) + '" alt="Фото" loading="lazy" data-action="cv-open-image" data-url="' + esc(m.image_url) + '">'
+      : "";
+
+    return '<article class="chat-msg ' + (mine ? "mine" : "") + '" data-cv-mid="' + m.id + '">' +
+      '<span class="avatar sm">' + esc(initials(m.author_name)) + '</span>' +
+      '<div class="chat-bubble">' +
+        '<header>' +
+          '<b>' + esc(m.author_name) + '</b>' +
+          (typeof roleBadge === "function" ? roleBadge(m.author_role) : "") +
+          '<time>' + chatTime(m.created_at) + '</time>' +
+          (canDelete ? '<button class="chat-del" data-action="cv-delete-message" data-id="' + m.id + '" title="Удалить">' + icon("trash", 12) + '</button>' : "") +
+        '</header>' +
+        image +
+        body +
+      '</div>' +
+    '</article>';
+  }
+
+  function renderMessages() {
+    var wrap = $("#cvMessages");
+    if (!wrap) return;
+
+    if (!S.active) {
+      wrap.innerHTML = '<div class="chat-empty">' + icon("chat", 30) + '<p>Выбери диалог слева.</p></div>';
+      return;
+    }
+
+    if (!S.messages.length) {
+      wrap.innerHTML = '<div class="chat-empty">' + icon("chat", 30) + '<p>Сообщений пока нет.<br>Напиши первым или отправь фото.</p></div>';
+      return;
+    }
+
+    wrap.innerHTML = S.messages.map(messageHTML).join("");
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  function renderRoomHead() {
+    var head = $("#cvRoomHead");
+    if (!head) return;
+    var c = S.conversations.find(function (x) { return x.id === S.active; });
+    if (!c) {
+      head.innerHTML = "<b>Чат</b>";
+      return;
+    }
+
+    var canDeleteGroup = c.kind === "group" && !c.is_general &&
+      (isOwner() || c.created_by === member.user_id);
+
+    head.innerHTML =
+      '<div class="cv-room-title">' +
+        '<span class="avatar sm">' + esc(convInitials(c)) + '</span>' +
+        '<div><b>' + esc(convName(c)) + '</b>' +
+        '<small>' + (c.kind === "direct" ? "Личный диалог" : (c.members || []).length + " участников") + '</small></div>' +
+      '</div>' +
+      (canDeleteGroup ? '<button class="icon-btn" data-action="cv-delete-group" data-id="' + c.id + '" title="Удалить группу">' + icon("trash", 14) + '</button>' : "");
+  }
+
+  window.renderChat = function () {
+    renderConversationList();
+    renderRoomHead();
+    renderMessages();
+  };
+
+  window.viewChat = function () {
+    if (!safeStaff()) return emptyBlock("Только для команды", "Чат доступен владельцу и учителям.");
+
+    return '<div class="page-head reveal">' +
+        '<div><h1>Чат команды</h1><p class="sub">Группы, личные сообщения и фото</p></div>' +
+        '<div class="cv-head-actions">' +
+          '<button class="btn soft" data-action="cv-new-direct">' + icon("mail", 15) + ' Личное</button>' +
+          '<button class="btn primary" data-action="cv-new-group">' + icon("plus", 15) + ' Группа</button>' +
+          '<button class="btn ghost" data-action="cv-refresh">' + icon("refresh", 15) + '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="cv-grid">' +
+        '<aside class="card cv-side reveal" style="--i:1">' +
+          '<div class="cv-side-head"><b>Диалоги</b><span>' + S.conversations.length + '</span></div>' +
+          '<div id="cvConversations" class="cv-list"></div>' +
+        '</aside>' +
+        '<section class="card cv-room reveal" style="--i:2">' +
+          '<header id="cvRoomHead" class="cv-room-head"></header>' +
+          '<div id="cvMessages" class="chat-messages cv-messages"></div>' +
+          '<form id="cvForm" class="chat-form cv-form">' +
+            '<input type="file" id="cvFile" accept="image/png,image/jpeg,image/webp,image/gif" hidden>' +
+            '<button type="button" class="btn ghost cv-attach" data-action="cv-photo" title="Отправить фото">' + icon("upload", 16) + '</button>' +
+            '<input name="body" id="cvBody" maxlength="2000" placeholder="Сообщение или подпись к фото…" autocomplete="off">' +
+            '<button class="btn primary" type="submit" title="Отправить">' + icon("send", 15) + '</button>' +
+          '</form>' +
+        '</section>' +
+      '</div>';
+  };
+
+  function openGroupModal() {
+    var staff = S.members.filter(function (m) {
+      return (m.role === "owner" || m.role === "teacher") && member && m.user_id !== member.user_id;
+    });
+
+    openModal(
+      '<h3>Новая группа</h3>' +
+      '<form id="cvGroupForm">' +
+        '<label class="field">Название<input name="name" required maxlength="60" placeholder="Например: Утренняя группа"></label>' +
+        '<div class="field"><span>Участники</span>' +
+          '<div class="cv-checks">' +
+            (staff.length
+              ? staff.map(function (m) {
+                  return '<label class="cv-check">' +
+                    '<input type="checkbox" name="user" value="' + m.user_id + '">' +
+                    '<span class="avatar sm">' + esc(initials(m.name || m.email)) + '</span>' +
+                    '<span><b>' + esc(m.name || m.email || "Участник") + '</b><small>' + roleLabel(m.role) + '</small></span>' +
+                  '</label>';
+                }).join("")
+              : '<div class="empty-list" style="padding:12px">Нет других учителей.</div>') +
+          '</div>' +
+        '</div>' +
+        '<div class="modal-actions">' +
+          '<button type="button" class="btn ghost" data-action="modal-close">Отмена</button>' +
+          '<button class="btn primary" type="submit">' + icon("plus", 14) + ' Создать</button>' +
+        '</div>' +
+      '</form>'
+    );
+  }
+
+  function openDirectModal() {
+    var staff = S.members.filter(function (m) {
+      return (m.role === "owner" || m.role === "teacher") && member && m.user_id !== member.user_id;
+    });
+
+    openModal(
+      '<h3>Личное сообщение</h3>' +
+      '<p>Выбери, кому написать.</p>' +
+      '<div class="cv-direct-list">' +
+        (staff.length
+          ? staff.map(function (m) {
+              return '<button class="cv-direct-item" data-action="cv-start-direct" data-id="' + m.user_id + '">' +
+                '<span class="avatar sm">' + esc(initials(m.name || m.email)) + '</span>' +
+                '<span><b>' + esc(m.name || m.email || "Участник") + '</b><small>' + roleLabel(m.role) + '</small></span>' +
+              '</button>';
+            }).join("")
+          : '<div class="empty-list" style="padding:12px">Нет других учителей.</div>') +
+      '</div>' +
+      '<div class="modal-actions"><button class="btn ghost" data-action="modal-close">Закрыть</button></div>'
+    );
+  }
+
+  async function startDirect(userId) {
+    var res = await rpc("hifz_create_conversation", {
+      p_kind: "direct",
+      p_name: null,
+      p_user_ids: [userId]
+    });
+    if (res.error) throw res.error;
+    closeModal();
+    S.active = res.data;
+    await window.loadChatData();
+    renderAll();
+    toast("Личный диалог открыт");
+  }
+
+  async function sendText() {
+    var input = $("#cvBody");
+    var text = input ? input.value.trim() : "";
+    if (!text || !S.active) return;
+    input.value = "";
+
+    var res = await rpc("hifz_send_conversation_message", {
+      p_conversation: S.active,
+      p_body: text,
+      p_image_url: null
+    });
+    if (res.error) throw res.error;
+
+    if (res.data && !S.messages.some(function (m) { return m.id === res.data.id; })) {
+      S.messages.push(res.data);
+    }
+
+    await fetchConversations();
+    await markRead(S.active);
+    window.renderChat();
+    Sound.play("save");
+  }
+
+  async function sendPhoto(file) {
+    if (!file || !S.active || S.uploading) return;
+
+    if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) {
+      toast("Можно отправлять PNG, JPG, WEBP или GIF", { type: "danger" });
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      toast("Фото слишком большое. Максимум 10 МБ", { type: "danger" });
+      return;
+    }
+
+    S.uploading = true;
+    toast("Загружаем фото…", { type: "info", duration: 2500 });
+
+    try {
+      var ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+      var path = S.active + "/" + member.user_id + "/" + Date.now() + "-" + Math.random().toString(36).slice(2) + "." + ext;
+
+      var up = await client.storage.from("hifz-chat").upload(path, file, {
+        cacheControl: "3600",
+        contentType: file.type,
+        upsert: false
+      });
+      if (up.error) throw up.error;
+
+      var pub = client.storage.from("hifz-chat").getPublicUrl(path);
+      var caption = $("#cvBody") ? $("#cvBody").value.trim() : "";
+      if ($("#cvBody")) $("#cvBody").value = "";
+
+      var res = await rpc("hifz_send_conversation_message", {
+        p_conversation: S.active,
+        p_body: caption || null,
+        p_image_url: pub.data.publicUrl
+      });
+      if (res.error) throw res.error;
+
+      if (res.data && !S.messages.some(function (m) { return m.id === res.data.id; })) {
+        S.messages.push(res.data);
+      }
+
+      await fetchConversations();
+      await markRead(S.active);
+      window.renderChat();
+      Sound.play("save");
+    } finally {
+      S.uploading = false;
+    }
+  }
+
+  async function deleteMessage(id) {
+    var res = await rpc("hifz_delete_conversation_message", { p_id: id });
+    if (res.error) throw res.error;
+    S.messages = S.messages.filter(function (m) { return m.id !== id; });
+    await fetchConversations();
+    window.renderChat();
+    toast("Сообщение удалено", { type: "info" });
+  }
+
+  async function deleteGroup(id) {
+    var res = await rpc("hifz_delete_conversation", { p_id: id });
+    if (res.error) throw res.error;
+    S.active = null;
+    await window.loadChatData();
+    renderAll();
+    toast("Группа удалена", { type: "info" });
+  }
+
+  function ping() {
+    try {
+      if (typeof prefs !== "undefined" && !prefs.sound) return;
+      if (typeof Sound === "undefined") return;
+      Sound.ensure();
+      if (!Sound.ctx) return;
+      var t = Sound.ctx.currentTime;
+      Sound.tone(880, t, 0.09, 0.04);
+      Sound.tone(1174.7, t + 0.075, 0.13, 0.035);
+    } catch (e) {}
+  }
+
+  async function onRealtimeMessage(msg) {
+    if (!msg || !member) return;
+
+    if (msg.conversation_id === S.active) {
+      if (!S.messages.some(function (m) { return m.id === msg.id; })) {
+        S.messages.push(msg);
+        S.messages.sort(function (a, b) { return new Date(a.created_at) - new Date(b.created_at); });
+        renderMessages();
+      }
+      await markRead(S.active);
+    }
+
+    await fetchConversations();
+    renderConversationList();
+    refreshBadge();
+
+    if (msg.user_id !== member.user_id && msg.conversation_id !== S.active) {
+      ping();
+    }
+  }
+
+  var _subscribeCloud = window.subscribeCloud;
+  var _unsubscribeCloud = window.unsubscribeCloud;
+
+  window.unsubscribeCloud = function () {
+    if (cvMsgChannel) { try { client.removeChannel(cvMsgChannel); } catch (e) {} cvMsgChannel = null; }
+    if (cvMemberChannel) { try { client.removeChannel(cvMemberChannel); } catch (e) {} cvMemberChannel = null; }
+    if (cvConvChannel) { try { client.removeChannel(cvConvChannel); } catch (e) {} cvConvChannel = null; }
+    if (typeof _unsubscribeCloud === "function") _unsubscribeCloud.apply(this, arguments);
+  };
+
+  window.subscribeCloud = function () {
+    if (typeof _subscribeCloud === "function") _subscribeCloud.apply(this, arguments);
+    if (!client || !member || !safeStaff()) return;
+
+    try {
+      cvMsgChannel = client.channel("cv-messages")
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "hifz_chat_messages" }, function (p) {
+          onRealtimeMessage(p.new).catch(function () {});
+        })
+        .subscribe();
+
+      cvMemberChannel = client.channel("cv-members")
+        .on("postgres_changes", { event: "*", schema: "public", table: "hifz_conversation_members" }, function () {
+          window.loadChatData().then(function () {
+            if (ui.view === "chat") window.renderChat();
+          }).catch(function () {});
+        })
+        .subscribe();
+
+      cvConvChannel = client.channel("cv-conversations")
+        .on("postgres_changes", { event: "*", schema: "public", table: "hifz_conversations" }, function () {
+          fetchConversations().then(function () {
+            renderConversationList();
+            refreshBadge();
+          }).catch(function () {});
+        })
+        .subscribe();
+    } catch (e) {}
+  };
+
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-action]");
+    if (!t) return;
+    var a = t.dataset.action;
+    var id = t.dataset.id;
+
+    if (a === "cv-select") {
+      e.preventDefault(); e.stopPropagation();
+      try {
+        S.active = id;
+        await fetchMessages(id);
+        await markRead(id);
+        window.renderChat();
+      } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+
+    if (a === "cv-refresh") {
+      e.preventDefault(); e.stopPropagation();
+      try { await window.loadChatData(); window.renderChat(); } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+
+    if (a === "cv-new-group") {
+      e.preventDefault(); e.stopPropagation();
+      openGroupModal();
+      return;
+    }
+
+    if (a === "cv-new-direct") {
+      e.preventDefault(); e.stopPropagation();
+      openDirectModal();
+      return;
+    }
+
+    if (a === "cv-start-direct") {
+      e.preventDefault(); e.stopPropagation();
+      try { await startDirect(id); } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+
+    if (a === "cv-photo") {
+      e.preventDefault(); e.stopPropagation();
+      var file = $("#cvFile");
+      if (file) file.click();
+      return;
+    }
+
+    if (a === "cv-open-image") {
+      e.preventDefault(); e.stopPropagation();
+      var url = t.dataset.url;
+      openModal('<div class="cv-lightbox"><img src="' + esc(url) + '" alt="Фото"><div class="modal-actions"><a class="btn soft" href="' + esc(url) + '" target="_blank" rel="noopener">Открыть оригинал</a><button class="btn ghost" data-action="modal-close">Закрыть</button></div></div>');
+      return;
+    }
+
+    if (a === "cv-delete-message") {
+      e.preventDefault(); e.stopPropagation();
+      try { await deleteMessage(id); } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+
+    if (a === "cv-delete-group") {
+      e.preventDefault(); e.stopPropagation();
+      openModal('<h3>Удалить группу?</h3><p>Все сообщения группы будут удалены.</p><div class="modal-actions"><button class="btn ghost" data-action="modal-close">Отмена</button><button class="btn danger" data-action="cv-confirm-delete-group" data-id="' + id + '">Удалить</button></div>');
+      return;
+    }
+
+    if (a === "cv-confirm-delete-group") {
+      e.preventDefault(); e.stopPropagation();
+      closeModal();
+      try { await deleteGroup(id); } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+  }, true);
+
+  document.addEventListener("submit", async function (e) {
+    var f = e.target;
+
+    if (f.id === "cvForm") {
+      e.preventDefault(); e.stopPropagation();
+      try { await sendText(); } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+
+    if (f.id === "cvGroupForm") {
+      e.preventDefault(); e.stopPropagation();
+      try {
+        var name = f.elements.name.value.trim();
+        var ids = Array.from(f.querySelectorAll('input[name="user"]:checked')).map(function (i) { return i.value; });
+        if (!name) return;
+        if (!ids.length) { toast("Выбери хотя бы одного участника", { type: "danger" }); return; }
+
+        var res = await rpc("hifz_create_conversation", {
+          p_kind: "group",
+          p_name: name,
+          p_user_ids: ids
+        });
+        if (res.error) throw res.error;
+
+        closeModal();
+        S.active = res.data;
+        await window.loadChatData();
+        renderAll();
+        toast("Группа создана");
+        Sound.play("save");
+      } catch (err) { toast(humanError(err), { type: "danger" }); }
+      return;
+    }
+  }, true);
+
+  document.addEventListener("change", async function (e) {
+    if (e.target.id === "cvFile") {
+      var file = e.target.files && e.target.files[0];
+      e.target.value = "";
+      if (file) {
+        try { await sendPhoto(file); } catch (err) { toast(humanError(err), { type: "danger" }); }
+      }
+    }
+  }, true);
+
+  if (!document.getElementById("hifz-chat-plus-css")) {
+    var st = document.createElement("style");
+    st.id = "hifz-chat-plus-css";
+    st.textContent = [
+      ".cv-head-actions{display:flex;gap:8px;flex-wrap:wrap}",
+      ".cv-grid{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start}",
+      ".cv-side{padding:0;overflow:hidden;position:sticky;top:82px}",
+      ".cv-side-head{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-bottom:1px solid var(--line);background:var(--surface2)}",
+      ".cv-side-head b{font-size:13px;font-weight:800}",
+      ".cv-side-head span{font-size:11px;font-weight:800;color:var(--muted);background:var(--surface3);padding:2px 8px;border-radius:9px}",
+      ".cv-list{max-height:min(620px,calc(100vh - 240px));overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:5px}",
+      ".cv-item{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;cursor:pointer;padding:9px;border-radius:12px;text-align:left;transition:.15s}",
+      ".cv-item:hover{background:var(--surface2)}",
+      ".cv-item.active{background:var(--blue-soft)}",
+      ".cv-item-main{flex:1;min-width:0}",
+      ".cv-item-main b{display:block;font-size:12.5px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".cv-item-main small{display:block;font-size:11px;color:var(--muted);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}",
+      ".cv-unread{min-width:19px;height:19px;padding:0 6px;border-radius:10px;background:linear-gradient(135deg,var(--violet),var(--blue));color:#fff;font-size:10.5px;font-weight:800;display:grid;place-items:center;flex:none}",
+      ".cv-room{padding:0;overflow:hidden;display:flex;flex-direction:column;height:min(680px,calc(100vh - 220px))}",
+      ".cv-room-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 16px;border-bottom:1px solid var(--line);background:var(--surface2)}",
+      ".cv-room-title{display:flex;align-items:center;gap:10px;min-width:0}",
+      ".cv-room-title b{display:block;font-size:13.5px;font-weight:800}",
+      ".cv-room-title small{display:block;font-size:11px;color:var(--muted);font-weight:600;margin-top:1px}",
+      ".cv-messages{flex:1}",
+      ".cv-form{align-items:center}",
+      ".cv-attach{width:42px;padding:0;flex:none}",
+      ".cv-photo{display:block;max-width:min(320px,100%);max-height:320px;object-fit:cover;border-radius:11px;margin:6px 0;cursor:zoom-in;border:1px solid var(--line)}",
+      ".cv-checks{display:flex;flex-direction:column;gap:6px;max-height:260px;overflow-y:auto}",
+      ".cv-check{display:flex;align-items:center;gap:10px;padding:8px;border-radius:11px;background:var(--surface2);cursor:pointer}",
+      ".cv-check input{width:17px;height:17px;min-height:0;accent-color:var(--blue);flex:none}",
+      ".cv-check b{display:block;font-size:12.5px;font-weight:800;color:var(--ink)}",
+      ".cv-check small{display:block;font-size:11px;color:var(--muted);font-weight:600}",
+      ".cv-direct-list{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto}",
+      ".cv-direct-item{display:flex;align-items:center;gap:10px;width:100%;border:0;background:var(--surface2);cursor:pointer;padding:10px;border-radius:12px;text-align:left;transition:.15s}",
+      ".cv-direct-item:hover{background:var(--blue-soft)}",
+      ".cv-direct-item b{display:block;font-size:13px;font-weight:800}",
+      ".cv-direct-item small{display:block;font-size:11px;color:var(--muted);font-weight:600}",
+      ".cv-lightbox img{display:block;max-width:100%;max-height:70vh;object-fit:contain;border-radius:12px;margin:0 auto 14px}",
+      "@media(max-width:1000px){.cv-grid{grid-template-columns:1fr}.cv-side{position:static}.cv-list{max-height:220px}.cv-room{height:min(560px,70vh)}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  var _renderView = window.renderView;
+  window.renderView = function () {
+    var r = _renderView.apply(this, arguments);
+    if (typeof ui !== "undefined" && ui.view === "chat") {
+      setTimeout(function () { refreshBadge(); }, 60);
+    }
+    return r;
+  };
+
+  var _go = window.go;
+  window.go = function (v, id) {
+    var r = _go.apply(this, arguments);
+    if (v === "chat") {
+      setTimeout(function () {
+        markRead(S.active).catch(function () {});
+        refreshBadge();
+      }, 120);
+    }
+    return r;
+  };
+
+  window.addEventListener("focus", function () {
+    if (safeStaff()) {
+      setTimeout(function () {
+        fetchConversations().then(function () {
+          renderConversationList();
+          refreshBadge();
+        }).catch(function () {});
+      }, 300);
+    }
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && typeof ui !== "undefined" && ui.view === "chat") {
+      setTimeout(function () {
+        markRead(S.active).catch(function () {});
+        refreshBadge();
+      }, 120);
+    }
+  });
+
+  if (typeof member !== "undefined" && member && safeStaff()) {
+    window.subscribeCloud();
+    if (typeof ui !== "undefined" && ui.view === "chat") {
+      window.loadChatData().then(function () { renderAll(); }).catch(function () {});
+    }
+  }
+})();
+</script>
 </body>
    </html>
