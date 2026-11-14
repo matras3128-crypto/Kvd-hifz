@@ -4884,5 +4884,345 @@ initCloud();
   }
 })();
 </script>
+<script>
+/* ==========================================================
+   HIFZ CHAT PRESENCE
+   Вставь ПОСЛЕ всех предыдущих чат-хотфиксов и ПЕРЕД </body>.
+   Показывает онлайн-точки, «в сети / 5 мин назад» и панель команды.
+   ========================================================== */
+(function () {
+  if (window.__hifzPresence) return;
+  window.__hifzPresence = true;
+
+  var ONLINE_MS = 120000;
+  var BEAT_MS = 45000;
+  var CONV_MS = 60000;
+
+  var P = { members: {}, convs: [] };
+  var lastBeat = 0;
+  var lastConv = 0;
+  var presChannel = null;
+  var presConvChannel = null;
+  var ticker = null;
+
+  function me() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function view() { try { return typeof ui !== "undefined" ? ui.view : ""; } catch (e) { return ""; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+
+  function seenOf(uid) {
+    var m = P.members[uid];
+    return m && m.last_seen_at ? m.last_seen_at : null;
+  }
+
+  function isOnline(ts) {
+    if (!ts) return false;
+    var diff = Date.now() - new Date(ts).getTime();
+    return diff >= -30000 && diff < ONLINE_MS;
+  }
+
+  function fmtSeen(ts) {
+    if (!ts) return "ещё не заходил";
+    var d = new Date(ts);
+    var diff = Date.now() - d.getTime();
+    if (diff < 0) diff = 0;
+    if (diff < ONLINE_MS) return "в сети";
+
+    var min = Math.floor(diff / 60000);
+    if (min < 60) return min + " мин назад";
+
+    var day = dstr(d);
+    var t = today();
+    var hm = fmtTime.format(d);
+
+    if (day === t) return "сегодня в " + hm;
+    if (day === addD(t, -1)) return "вчера в " + hm;
+    return fmtDay.format(d) + " в " + hm;
+  }
+
+  function fullStamp(ts) {
+    if (!ts) return "Визитов пока не было";
+    var d = new Date(ts);
+    return fmtDay.format(d) + " · " + fmtTime.format(d);
+  }
+
+  async function touch() {
+    var m = me();
+    if (!m || !staff()) return;
+    lastBeat = Date.now();
+    try {
+      await rpc("hifz_touch_presence");
+      if (P.members[m.user_id]) P.members[m.user_id].last_seen_at = new Date().toISOString();
+      decorate();
+    } catch (e) {}
+  }
+
+  async function loadMembers() {
+    if (!staff()) return;
+    try {
+      var res = await client.from("hifz_members").select("*");
+      if (res.error) return;
+      var map = {};
+      (res.data || []).forEach(function (x) { map[x.user_id] = x; });
+      P.members = map;
+    } catch (e) {}
+  }
+
+  async function loadConvs() {
+    if (!staff()) return;
+    lastConv = Date.now();
+    try {
+      var res = await rpc("hifz_list_conversations");
+      if (!res.error) P.convs = res.data || [];
+    } catch (e) {}
+  }
+
+  function ensureDot(host, online) {
+    if (!host) return;
+    var dot = host.querySelector(".cv-dot");
+    if (!dot) {
+      dot = document.createElement("i");
+      dot.className = "cv-dot";
+      host.appendChild(dot);
+    }
+    dot.className = "cv-dot " + (online ? "on" : "off");
+  }
+
+  function otherOf(c) {
+    var m = me();
+    if (!c || !m) return null;
+    return (c.members || []).find(function (x) { return x.user_id !== m.user_id; }) || null;
+  }
+
+  function decorate() {
+    var m = me();
+    if (!m || !staff()) return;
+
+    var side = document.querySelector(".cv-side") || document.querySelector(".chat-side");
+    if (!side) return;
+
+    /* точки на диалогах */
+    document.querySelectorAll(".cv-item[data-id]").forEach(function (el) {
+      var c = P.convs.find(function (x) { return x.id === el.dataset.id; });
+      if (!c) return;
+      var online = false;
+      if (c.kind === "direct") {
+        var o = otherOf(c);
+        online = o ? isOnline(seenOf(o.user_id)) : false;
+      } else {
+        online = (c.members || []).some(function (x) {
+          return x.user_id !== m.user_id && isOnline(seenOf(x.user_id));
+        });
+      }
+      ensureDot(el.querySelector(".avatar"), online);
+    });
+
+    /* статус в шапке диалога */
+    var headSmall = document.querySelector("#cvRoomHead .cv-room-title small");
+    var activeEl = document.querySelector(".cv-item.active");
+    if (headSmall && activeEl) {
+      var conv = P.convs.find(function (x) { return x.id === activeEl.dataset.id; });
+      if (conv) {
+        if (conv.kind === "direct") {
+          var oth = otherOf(conv);
+          var ts = oth ? seenOf(oth.user_id) : null;
+          headSmall.innerHTML =
+            '<i class="cv-dot inline ' + (isOnline(ts) ? "on" : "off") + '"></i>' +
+            esc(fmtSeen(ts));
+          headSmall.title = oth ? fullStamp(ts) : "";
+        } else {
+          var total = (conv.members || []).length;
+          var onl = (conv.members || []).filter(function (x) { return isOnline(seenOf(x.user_id)); }).length;
+          headSmall.innerHTML =
+            '<i class="cv-dot inline ' + (onl > 1 ? "on" : "off") + '"></i>' +
+            onl + " в сети · " + total + " участников";
+          headSmall.title = "";
+        }
+      }
+    }
+
+    /* панель команды */
+    var panel = document.getElementById("cvPresence");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "cvPresence";
+      panel.className = "cv-presence";
+      side.appendChild(panel);
+    }
+
+    var team = Object.keys(P.members).map(function (k) { return P.members[k]; })
+      .filter(function (x) { return x.role === "owner" || x.role === "teacher"; });
+
+    team.sort(function (a, b) {
+      var ao = isOnline(seenOf(a.user_id)) ? 1 : 0;
+      var bo = isOnline(seenOf(b.user_id)) ? 1 : 0;
+      if (ao !== bo) return bo - ao;
+      return new Date(seenOf(b.user_id) || 0) - new Date(seenOf(a.user_id) || 0);
+    });
+
+    var onlineCount = team.filter(function (x) { return isOnline(seenOf(x.user_id)); }).length;
+
+    panel.innerHTML =
+      '<div class="cv-presence-head"><b>Команда</b><span>' + onlineCount + ' в сети</span></div>' +
+      '<div class="cv-presence-list">' +
+        (team.length
+          ? team.map(function (x) {
+              var ts = seenOf(x.user_id);
+              var on = isOnline(ts);
+              var self = x.user_id === m.user_id;
+              return '<div class="cv-presence-row ' + (on ? "online" : "") + '" title="' + esc(fullStamp(ts)) + '">' +
+                '<span class="avatar sm">' + esc(initials(x.name || x.email)) + '<i class="cv-dot ' + (on ? "on" : "off") + '"></i></span>' +
+                '<span class="cv-presence-main">' +
+                  '<b>' + esc(x.name || x.email || "Участник") + (self ? ' <em class="cv-presence-me">вы</em>' : "") + '</b>' +
+                  '<small>' + esc(self && on ? "в сети" : fmtSeen(ts)) + '</small>' +
+                '</span>' +
+              '</div>';
+            }).join("")
+          : '<div class="empty-list" style="padding:10px">Пока никого.</div>') +
+      '</div>';
+  }
+
+  /* --- оборачиваем существующие функции --- */
+
+  if (typeof window.renderChat === "function") {
+    var _renderChat = window.renderChat;
+    window.renderChat = function () {
+      var r = _renderChat.apply(this, arguments);
+      decorate();
+      return r;
+    };
+  }
+
+  if (typeof window.loadChatData === "function") {
+    var _loadChatData = window.loadChatData;
+    window.loadChatData = async function () {
+      var r = await _loadChatData.apply(this, arguments);
+      await loadMembers();
+      await loadConvs();
+      await touch();
+      decorate();
+      return r;
+    };
+  }
+
+  if (typeof window.renderView === "function") {
+    var _renderView = window.renderView;
+    window.renderView = function () {
+      var r = _renderView.apply(this, arguments);
+      if (view() === "chat") setTimeout(decorate, 40);
+      return r;
+    };
+  }
+
+  var _subscribe = window.subscribeCloud;
+  var _unsubscribe = window.unsubscribeCloud;
+
+  window.unsubscribeCloud = function () {
+    if (presChannel) { try { client.removeChannel(presChannel); } catch (e) {} presChannel = null; }
+    if (presConvChannel) { try { client.removeChannel(presConvChannel); } catch (e) {} presConvChannel = null; }
+    if (typeof _unsubscribe === "function") _unsubscribe.apply(this, arguments);
+  };
+
+  window.subscribeCloud = function () {
+    if (typeof _subscribe === "function") _subscribe.apply(this, arguments);
+    var m = me();
+    if (!client || !m || !staff()) return;
+
+    try {
+      presChannel = client.channel("hifz-presence")
+        .on("postgres_changes", { event: "UPDATE", schema: "public", table: "hifz_members" }, function (p) {
+          if (p.new && p.new.user_id) {
+            P.members[p.new.user_id] = Object.assign({}, P.members[p.new.user_id] || {}, p.new);
+            if (view() === "chat") decorate();
+          }
+        })
+        .subscribe();
+
+      presConvChannel = client.channel("hifz-presence-conv")
+        .on("postgres_changes", { event: "*", schema: "public", table: "hifz_conversation_members" }, function () {
+          loadConvs().then(function () { if (view() === "chat") decorate(); });
+        })
+        .subscribe();
+    } catch (e) {}
+  };
+
+  /* --- сердцебиение и обновление времени --- */
+
+  function tick() {
+    var m = me();
+    if (!m || !staff()) return;
+
+    if (document.visibilityState === "visible" && Date.now() - lastBeat >= BEAT_MS) {
+      touch();
+    }
+    if (view() === "chat") {
+      if (Date.now() - lastConv >= CONV_MS) {
+        loadConvs().then(decorate);
+      } else {
+        decorate();
+      }
+    }
+  }
+
+  if (!ticker) ticker = setInterval(tick, 15000);
+
+  window.addEventListener("focus", function () {
+    if (!staff()) return;
+    loadMembers().then(function () {
+      touch();
+      decorate();
+    });
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!staff()) return;
+    if (document.visibilityState === "visible") {
+      loadMembers().then(function () { touch(); decorate(); });
+    } else {
+      touch();
+    }
+  });
+
+  window.addEventListener("pagehide", function () {
+    if (staff()) touch();
+  });
+
+  /* --- стили --- */
+  if (!document.getElementById("hifz-presence-css")) {
+    var st = document.createElement("style");
+    st.id = "hifz-presence-css";
+    st.textContent = [
+      ".cv-item .avatar,.cv-room-title .avatar,.cv-presence-row .avatar{position:relative;overflow:visible}",
+      ".cv-dot{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;border:2px solid var(--surface);background:var(--faint);display:block;transition:background .2s}",
+      ".cv-dot.on{background:var(--green);box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 22%,transparent)}",
+      ".cv-dot.off{background:var(--faint)}",
+      ".cv-dot.inline{position:static;display:inline-block;width:7px;height:7px;border:0;margin-right:6px;vertical-align:middle;box-shadow:none}",
+      ".cv-presence{border-top:1px solid var(--line);padding:12px 14px;background:var(--surface2)}",
+      ".cv-presence-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}",
+      ".cv-presence-head b{font-size:11px;font-weight:800;letter-spacing:.7px;text-transform:uppercase;color:var(--muted)}",
+      ".cv-presence-head span{font-size:10.5px;font-weight:800;color:var(--green);background:var(--green-soft);padding:3px 9px;border-radius:9px}",
+      ".cv-presence-list{display:flex;flex-direction:column;gap:7px;max-height:240px;overflow-y:auto;padding-right:2px}",
+      ".cv-presence-row{display:flex;align-items:center;gap:9px}",
+      ".cv-presence-main{flex:1;min-width:0}",
+      ".cv-presence-main b{display:block;font-size:12px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".cv-presence-main small{display:block;font-size:10.5px;font-weight:600;color:var(--muted);margin-top:1px}",
+      ".cv-presence-row.online .cv-presence-main small{color:var(--green)}",
+      ".cv-presence-me{font-style:normal;font-size:9.5px;font-weight:800;color:var(--faint);background:var(--surface3);padding:1px 5px;border-radius:6px;margin-left:4px}",
+      "@media(max-width:1000px){.cv-presence-list{max-height:180px}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* --- старт --- */
+  (async function () {
+    var m = me();
+    if (!m || !staff()) return;
+    await loadMembers();
+    await loadConvs();
+    await touch();
+    if (typeof window.subscribeCloud === "function") window.subscribeCloud();
+    decorate();
+  })();
+})();
+</script>   
 </body>
    </html>
