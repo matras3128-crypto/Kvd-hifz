@@ -5224,5 +5224,537 @@ initCloud();
   })();
 })();
 </script>   
+<script>
+/* ==========================================================
+   HIFZ SAFE DELETE — подтверждение перед любым удалением
+   Вставь ПОСЛЕ всех остальных хотфиксов и ПЕРЕД </body>.
+   Перехватывает удаления на фазе window.capture, поэтому
+   срабатывает раньше всех остальных обработчиков.
+   ========================================================== */
+(function () {
+  if (window.__hifzSafeDelete) return;
+  window.__hifzSafeDelete = true;
+
+  var ROOT_ID = "hifzSafeDeleteRoot";
+  var open = false;
+  var lastFocus = null;
+  var prevOverflow = "";
+  var pending = null;
+
+  /* ---------- палитра и стили ---------- */
+  if (!document.getElementById("hifz-safe-delete-css")) {
+    var st = document.createElement("style");
+    st.id = "hifz-safe-delete-css";
+    st.textContent = [
+      ".hcf-back{position:fixed;inset:0;z-index:900;display:grid;place-items:center;padding:18px;",
+      "  background:radial-gradient(120% 90% at 50% 0%,rgba(201,42,42,.16),transparent 60%),rgba(8,14,22,.62);",
+      "  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:hcfFade .18s ease-out both}",
+      "@keyframes hcfFade{from{opacity:0}to{opacity:1}}",
+      ".hcf-card{position:relative;width:100%;max-width:452px;max-height:90vh;overflow-y:auto;",
+      "  background:var(--surface,#fff);border:1px solid var(--line,#dbe8f4);border-radius:20px;",
+      "  box-shadow:0 30px 80px rgba(8,14,22,.42),0 0 0 1px rgba(255,255,255,.04) inset;",
+      "  padding:26px 24px 20px;animation:hcfPop .26s cubic-bezier(.2,.8,.3,1.1) both}",
+      "@keyframes hcfPop{from{opacity:0;transform:translateY(14px) scale(.94)}to{opacity:1;transform:none}}",
+      ".hcf-card::before{content:'';position:absolute;left:0;right:0;top:0;height:3px;border-radius:20px 20px 0 0;",
+      "  background:linear-gradient(90deg,var(--hcf-a),var(--hcf-b))}",
+      ".hcf-card{--hcf-a:#e03131;--hcf-b:#c92a2a;--hcf-soft:var(--red-soft,#fbe5e5);--hcf-ink:var(--red,#cf3d3d)}",
+      ".hcf-card.warn{--hcf-a:#f59f00;--hcf-b:#d9480f;--hcf-soft:var(--amber-soft,#fdf0d5);--hcf-ink:var(--amber,#b97708)}",
+      ".hcf-icon{width:54px;height:54px;border-radius:17px;display:grid;place-items:center;margin-bottom:15px;",
+      "  background:linear-gradient(135deg,var(--hcf-a),var(--hcf-b));color:#fff;",
+      "  box-shadow:0 10px 26px color-mix(in srgb,var(--hcf-a) 38%,transparent);animation:hcfBeat 2.4s ease-in-out infinite}",
+      "@keyframes hcfBeat{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}",
+      ".hcf-title{font-size:19px;font-weight:800;letter-spacing:-.3px;line-height:1.25;color:var(--ink,#12263f);margin-bottom:7px}",
+      ".hcf-text{font-size:13.5px;font-weight:500;line-height:1.55;color:var(--muted,#5d7590);margin-bottom:14px}",
+      ".hcf-target{display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:13px;",
+      "  background:var(--surface2,#f6f9fd);border:1px solid var(--line,#dbe8f4);margin-bottom:13px}",
+      ".hcf-target-av{width:36px;height:36px;border-radius:11px;flex:none;display:grid;place-items:center;",
+      "  background:linear-gradient(135deg,var(--hcf-a),var(--hcf-b));color:#fff;font-weight:800;font-size:13px}",
+      ".hcf-target-main{min-width:0;flex:1}",
+      ".hcf-target-main b{display:block;font-size:13.5px;font-weight:800;color:var(--ink,#12263f);",
+      "  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".hcf-target-main small{display:block;font-size:11.5px;font-weight:600;color:var(--muted,#5d7590);margin-top:2px;",
+      "  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".hcf-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin-bottom:13px}",
+      ".hcf-stat{background:var(--hcf-soft);border-radius:12px;padding:9px 11px}",
+      ".hcf-stat b{display:block;font-size:19px;font-weight:800;line-height:1.1;color:var(--hcf-ink)}",
+      ".hcf-stat span{display:block;font-size:10.5px;font-weight:700;color:var(--muted,#5d7590);margin-top:3px}",
+      ".hcf-note{display:flex;gap:9px;align-items:flex-start;font-size:12px;font-weight:600;line-height:1.5;",
+      "  color:var(--hcf-ink);background:var(--hcf-soft);border-radius:12px;padding:10px 12px;margin-bottom:14px}",
+      ".hcf-note svg{flex:none;margin-top:1px}",
+      ".hcf-type{display:block;margin-bottom:15px}",
+      ".hcf-type span{display:block;font-size:12px;font-weight:700;color:var(--muted,#5d7590);margin-bottom:7px}",
+      ".hcf-type code{font-family:ui-monospace,Menlo,monospace;font-weight:800;letter-spacing:1.2px;",
+      "  background:var(--hcf-soft);color:var(--hcf-ink);padding:2px 8px;border-radius:7px;font-size:12px}",
+      ".hcf-type input{width:100%;font:inherit;font-weight:800;font-size:14px;letter-spacing:1px;",
+      "  padding:11px 13px;min-height:44px;border-radius:12px;color:var(--ink,#12263f);",
+      "  background:var(--surface2,#f6f9fd);border:1.5px solid var(--line2,#c3d8ec);transition:.16s}",
+      ".hcf-type input:focus{outline:none;border-color:var(--hcf-a);background:var(--surface,#fff);",
+      "  box-shadow:0 0 0 3px color-mix(in srgb,var(--hcf-a) 18%,transparent)}",
+      ".hcf-type input.ok{border-color:var(--green,#1e8e52);box-shadow:0 0 0 3px color-mix(in srgb,var(--green,#1e8e52) 16%,transparent)}",
+      ".hcf-actions{display:flex;gap:10px}",
+      ".hcf-btn{flex:1;border:0;cursor:pointer;font:inherit;font-weight:800;font-size:14px;min-height:46px;",
+      "  border-radius:13px;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:.16s}",
+      ".hcf-btn:active{transform:scale(.97)}",
+      ".hcf-cancel{background:var(--surface2,#f6f9fd);color:var(--ink,#12263f);border:1.5px solid var(--line2,#c3d8ec)}",
+      ".hcf-cancel:hover{background:var(--surface3,#ecf4fb)}",
+      ".hcf-ok{background:linear-gradient(135deg,var(--hcf-a),var(--hcf-b));color:#fff;",
+      "  box-shadow:0 8px 22px color-mix(in srgb,var(--hcf-a) 34%,transparent)}",
+      ".hcf-ok:hover:not(:disabled){filter:brightness(1.07);transform:translateY(-1px)}",
+      ".hcf-ok:disabled{opacity:.42;cursor:not-allowed;box-shadow:none}",
+      ".hcf-hint{text-align:center;font-size:11px;font-weight:600;color:var(--faint,#92a8c0);margin-top:12px}",
+      ".hcf-hint kbd{font-family:inherit;font-weight:800;background:var(--surface3,#ecf4fb);",
+      "  border:1px solid var(--line,#dbe8f4);border-radius:5px;padding:1px 5px;font-size:10px}",
+      ".hcf-spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;",
+      "  border-radius:50%;animation:hcfSpin .7s linear infinite}",
+      "@keyframes hcfSpin{to{transform:rotate(360deg)}}",
+      ".hcf-card::-webkit-scrollbar{width:9px}",
+      ".hcf-card::-webkit-scrollbar-track{background:var(--surface3,#ecf4fb);border-radius:8px}",
+      ".hcf-card::-webkit-scrollbar-thumb{background:var(--hcf-a);border-radius:8px;border:2px solid var(--surface3,#ecf4fb)}",
+      ".hcf-card{scrollbar-width:thin;scrollbar-color:var(--hcf-a) var(--surface3,#ecf4fb)}",
+      "@media(max-width:430px){.hcf-card{padding:22px 18px 17px}.hcf-actions{flex-direction:column-reverse}}",
+      "@media(prefers-reduced-motion:reduce){.hcf-back,.hcf-card,.hcf-icon{animation:none}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- иконки ---------- */
+  var SVG = {
+    trash: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>',
+    alert: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>',
+    archive: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v11h14V9M10 13h4"/></svg>',
+    ban: '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg>',
+    info: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>',
+    undo: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M3.5 13a9 9 0 1 0 2.6-6.4L3 9"/></svg>'
+  };
+
+  function E(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function ini(s) {
+    try { return initials(s); } catch (e) { return String(s || "?").slice(0, 2).toUpperCase(); }
+  }
+  function pl(n, f) {
+    try { return plural(n, f); } catch (e) { return f[2]; }
+  }
+  function safeState() {
+    try { return typeof state !== "undefined" && state ? state : { students: [], passages: [], events: [], views: [] }; }
+    catch (e) { return { students: [], passages: [], events: [], views: [] }; }
+  }
+
+  function warnSound() {
+    try {
+      if (typeof prefs !== "undefined" && !prefs.sound) return;
+      if (typeof Sound === "undefined") return;
+      Sound.ensure();
+      if (!Sound.ctx) return;
+      var t = Sound.ctx.currentTime;
+      Sound.tone(320, t, 0.11, 0.035);
+      Sound.tone(240, t + 0.09, 0.16, 0.03);
+    } catch (e) {}
+  }
+
+  /* ---------- описание каждого действия ---------- */
+  function describe(a, id, el) {
+    var S = safeState();
+
+    if (a === "delete-student") {
+      var s = null;
+      try { s = byId(id); } catch (e) {}
+      var ps = S.passages.filter(function (p) { return p.sid === id; }).length;
+      var ev = S.events.filter(function (e2) { return e2.sid === id; }).length;
+      return {
+        tone: "danger", icon: "trash",
+        title: "Удалить ученицу?",
+        text: "Карточка ученицы и весь её прогресс исчезнут из журнала.",
+        target: s ? { name: s.name, sub: s.group } : { name: "Ученица", sub: "" },
+        stats: [
+          { n: ps, l: pl(ps, ["отрывок", "отрывка", "отрывков"]) },
+          { n: ev, l: pl(ev, ["запись", "записи", "записей"]) + " журнала" }
+        ],
+        note: "Это самое серьёзное удаление в журнале. Проверь, что выбрана правильная ученица.",
+        word: "УДАЛИТЬ",
+        ok: "Удалить ученицу"
+      };
+    }
+
+    if (a === "clear-all") {
+      return {
+        tone: "danger", icon: "alert",
+        title: "Очистить весь журнал?",
+        text: "Все ученицы, сдачи, повторения и сохранённые виды будут удалены разом.",
+        stats: [
+          { n: S.students.length, l: pl(S.students.length, ["ученица", "ученицы", "учениц"]) },
+          { n: S.passages.length, l: pl(S.passages.length, ["отрывок", "отрывка", "отрывков"]) },
+          { n: S.events.length, l: pl(S.events.length, ["запись", "записи", "записей"]) }
+        ],
+        note: "Сначала лучше скачать резервную копию: меню «Данные» → Резервная копия.",
+        word: "УДАЛИТЬ",
+        ok: "Очистить всё"
+      };
+    }
+
+    if (a === "delete-passage") {
+      var p = null;
+      try { p = pById(id); } catch (e) {}
+      var name = "Отрывок", sub = "";
+      if (p) {
+        try {
+          var su = SURAHS[p.surah - 1];
+          name = su[0] + ". " + su[1];
+          sub = (p.from === 1 && p.to === su[3]) ? "целиком" : "аяты " + p.from + "–" + p.to;
+        } catch (e) {}
+      }
+      return {
+        tone: "danger", icon: "trash",
+        title: "Удалить отрывок?",
+        text: "Выученный диапазон и его история повторений будут удалены.",
+        target: { name: name, sub: sub },
+        note: "Сразу после удаления можно нажать «Вернуть» в уведомлении.",
+        noteIcon: "undo",
+        ok: "Удалить"
+      };
+    }
+
+    if (a === "cv-delete-group") {
+      var gname = "Группа";
+      var node = document.querySelector('.cv-item[data-id="' + id + '"] .cv-item-main b');
+      if (node) gname = node.textContent.trim();
+      return {
+        tone: "danger", icon: "trash",
+        title: "Удалить группу?",
+        text: "Группа и все сообщения внутри неё будут удалены у всех участников.",
+        target: { name: gname, sub: "Групповой чат" },
+        note: "Отменить это действие будет нельзя.",
+        ok: "Удалить группу"
+      };
+    }
+
+    if (a === "cv-delete-message" || a === "chat-delete") {
+      var who = "Сообщение", preview = "";
+      var row = document.querySelector('[data-cv-mid="' + id + '"]') || document.querySelector('[data-mid="' + id + '"]');
+      if (row) {
+        var b = row.querySelector(".chat-bubble header b");
+        var t = row.querySelector(".chat-bubble p");
+        if (b) who = b.textContent.trim();
+        preview = t ? t.textContent.trim().slice(0, 70) : (row.querySelector(".cv-photo") ? "Фото" : "");
+      }
+      return {
+        tone: "danger", icon: "trash",
+        title: "Удалить сообщение?",
+        text: "Сообщение исчезнет у всех участников диалога.",
+        target: { name: who, sub: preview },
+        ok: "Удалить"
+      };
+    }
+
+    if (a === "delete-view") {
+      var v = (S.views || []).find(function (x) { return x.id === id; });
+      return {
+        tone: "warn", icon: "trash",
+        title: "Удалить сохранённый вид?",
+        text: "Настроенный фильтр исчезнет из быстрого доступа.",
+        target: { name: v ? v.name : "Вид", sub: "Сохранённый фильтр" },
+        note: "Можно вернуть сразу после удаления.",
+        noteIcon: "undo",
+        ok: "Удалить вид"
+      };
+    }
+
+    if (a === "revoke-invite") {
+      return {
+        tone: "warn", icon: "ban",
+        title: "Отозвать приглашение?",
+        text: "Код перестанет работать, и по нему больше нельзя будет зарегистрироваться.",
+        target: { name: el && el.dataset.code ? el.dataset.code : "Код", sub: "Приглашение" },
+        ok: "Отозвать"
+      };
+    }
+
+    if (a === "reject-request") {
+      var rq = null;
+      try { rq = (requests || []).find(function (x) { return x.id === id; }); } catch (e) {}
+      var rn = "Заявка", rs = "";
+      if (rq) {
+        try {
+          var st2 = byId(rq.student_id);
+          var su2 = SURAHS[rq.surah - 1];
+          rn = st2 ? st2.name : "Ученица";
+          rs = su2[0] + ". " + su2[1];
+        } catch (e) {}
+      }
+      return {
+        tone: "warn", icon: "ban",
+        title: "Отклонить заявку?",
+        text: "Заявка получит статус «отклонена», сдача записана не будет.",
+        target: { name: rn, sub: rs },
+        ok: "Отклонить"
+      };
+    }
+
+    if (a === "archive-student") {
+      var as = null;
+      try { as = byId(id); } catch (e) {}
+      return {
+        tone: "warn", icon: "archive",
+        title: "Отправить в архив?",
+        text: "Ученица пропадёт из списка активных и из «Сегодня», но все данные сохранятся.",
+        target: as ? { name: as.name, sub: as.group } : { name: "Ученица", sub: "" },
+        note: "Вернуть из архива можно в любой момент.",
+        noteIcon: "undo",
+        ok: "В архив"
+      };
+    }
+
+    return {
+      tone: "danger", icon: "alert",
+      title: "Подтвердите удаление",
+      text: "Это действие удалит данные. Продолжить?",
+      ok: "Удалить"
+    };
+  }
+
+  /* ---------- выполнение ---------- */
+  async function execute(a, id, el) {
+    var S = safeState();
+    switch (a) {
+      case "delete-student": deleteStudent(id); break;
+      case "delete-passage":
+        deletePassage(id);
+        if (typeof closeDrawer === "function") closeDrawer();
+        break;
+      case "archive-student": archiveStudent(id); break;
+      case "delete-view":
+        withUndo("Вид удалён", function () {
+          S.views = S.views.filter(function (v) { return v.id !== id; });
+        }, "info");
+        break;
+      case "clear-all":
+        withUndo("Все данные очищены", function () {
+          S.students = []; S.passages = []; S.events = []; S.views = [];
+        }, "info");
+        if (typeof go === "function") go("today");
+        break;
+      case "revoke-invite": {
+        var r = await rpc("hifz_revoke_invite", { inv_code: el.dataset.code });
+        if (r.error) throw r.error;
+        await loadTeam();
+        renderAll();
+        toast("Приглашение отозвано", { type: "info" });
+        break;
+      }
+      case "reject-request": await rejectRequest(id); break;
+      case "chat-delete": await window.deleteChatMessage(id); break;
+      case "cv-delete-message": {
+        var r2 = await rpc("hifz_delete_conversation_message", { p_id: id });
+        if (r2.error) throw r2.error;
+        await window.loadChatData();
+        renderAll();
+        toast("Сообщение удалено", { type: "info" });
+        break;
+      }
+      case "cv-delete-group": {
+        var r3 = await rpc("hifz_delete_conversation", { p_id: id });
+        if (r3.error) throw r3.error;
+        await window.loadChatData();
+        renderAll();
+        toast("Группа удалена", { type: "info" });
+        break;
+      }
+    }
+  }
+
+  /* ---------- модалка ---------- */
+  function root() {
+    var r = document.getElementById(ROOT_ID);
+    if (!r) {
+      r = document.createElement("div");
+      r.id = ROOT_ID;
+      document.body.appendChild(r);
+    }
+    return r;
+  }
+
+  function close() {
+    if (!open) return;
+    open = false;
+    pending = null;
+    root().innerHTML = "";
+    document.body.style.overflow = prevOverflow;
+    document.removeEventListener("keydown", onKey, true);
+    if (lastFocus && document.contains(lastFocus)) {
+      try { lastFocus.focus(); } catch (e) {}
+    }
+    lastFocus = null;
+  }
+
+  function onKey(e) {
+    if (!open) return;
+    if (e.key === "Escape") {
+      e.preventDefault(); e.stopPropagation();
+      close();
+      return;
+    }
+    if (e.key === "Enter") {
+      var ok = root().querySelector(".hcf-ok");
+      if (ok && !ok.disabled && document.activeElement.tagName !== "BUTTON") {
+        e.preventDefault(); e.stopPropagation();
+        ok.click();
+      }
+      return;
+    }
+    if (e.key === "Tab") {
+      var f = root().querySelectorAll("button:not(:disabled), input, a[href]");
+      if (!f.length) return;
+      var first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }
+
+  function ask(cfg, action, id, el) {
+    if (open) close();
+    open = true;
+    pending = { action: action, id: id, el: el };
+    lastFocus = document.activeElement;
+    prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    var html =
+      '<div class="hcf-back" data-hcf="back">' +
+        '<div class="hcf-card ' + (cfg.tone === "warn" ? "warn" : "") + '" role="alertdialog" aria-modal="true" aria-labelledby="hcfTitle">' +
+          '<div class="hcf-icon">' + SVG[cfg.icon] + '</div>' +
+          '<div class="hcf-title" id="hcfTitle">' + E(cfg.title) + '</div>' +
+          '<div class="hcf-text">' + E(cfg.text) + '</div>';
+
+    if (cfg.target && cfg.target.name) {
+      html +=
+        '<div class="hcf-target">' +
+          '<span class="hcf-target-av">' + E(ini(cfg.target.name)) + '</span>' +
+          '<span class="hcf-target-main">' +
+            '<b>' + E(cfg.target.name) + '</b>' +
+            (cfg.target.sub ? '<small>' + E(cfg.target.sub) + '</small>' : "") +
+          '</span>' +
+        '</div>';
+    }
+
+    if (cfg.stats && cfg.stats.length) {
+      html += '<div class="hcf-stats">' + cfg.stats.map(function (s) {
+        return '<div class="hcf-stat"><b>' + s.n + '</b><span>' + E(s.l) + '</span></div>';
+      }).join("") + '</div>';
+    }
+
+    if (cfg.note) {
+      html += '<div class="hcf-note">' + SVG[cfg.noteIcon || "info"] + '<span>' + E(cfg.note) + '</span></div>';
+    }
+
+    if (cfg.word) {
+      html +=
+        '<label class="hcf-type">' +
+          '<span>Для подтверждения введи <code>' + E(cfg.word) + '</code></span>' +
+          '<input type="text" id="hcfWord" autocomplete="off" spellcheck="false" placeholder="' + E(cfg.word) + '">' +
+        '</label>';
+    }
+
+    html +=
+          '<div class="hcf-actions">' +
+            '<button class="hcf-btn hcf-cancel" data-hcf="cancel">Отмена</button>' +
+            '<button class="hcf-btn hcf-ok" data-hcf="ok"' + (cfg.word ? " disabled" : "") + '>' +
+              E(cfg.ok || "Удалить") +
+            '</button>' +
+          '</div>' +
+          '<div class="hcf-hint"><kbd>Esc</kbd> — отмена' + (cfg.word ? "" : ' · <kbd>Enter</kbd> — подтвердить') + '</div>' +
+        '</div>' +
+      '</div>';
+
+    root().innerHTML = html;
+    warnSound();
+
+    var card = root().querySelector(".hcf-card");
+    var okBtn = root().querySelector(".hcf-ok");
+    var input = root().querySelector("#hcfWord");
+
+    if (input) {
+      input.addEventListener("input", function () {
+        var good = input.value.trim().toUpperCase() === cfg.word;
+        okBtn.disabled = !good;
+        input.classList.toggle("ok", good);
+      });
+      setTimeout(function () { input.focus(); }, 70);
+    } else {
+      setTimeout(function () { root().querySelector(".hcf-cancel").focus(); }, 70);
+    }
+
+    root().querySelector('[data-hcf="back"]').addEventListener("mousedown", function (e) {
+      if (e.target === this) close();
+    });
+    root().querySelector('[data-hcf="cancel"]').addEventListener("click", close);
+
+    okBtn.addEventListener("click", async function () {
+      if (okBtn.disabled || !pending) return;
+      var job = pending;
+      okBtn.disabled = true;
+      okBtn.innerHTML = '<span class="hcf-spin"></span> Удаляем…';
+      try {
+        await execute(job.action, job.id, job.el);
+        close();
+      } catch (err) {
+        close();
+        try { toast(humanError(err), { type: "danger" }); } catch (e) {}
+        try { Sound.play("err"); } catch (e) {}
+      }
+    });
+
+    card.addEventListener("mousedown", function (e) { e.stopPropagation(); });
+    document.addEventListener("keydown", onKey, true);
+  }
+
+  /* ---------- перехват ---------- */
+  var GUARDED = {
+    "delete-student": 1,
+    "delete-passage": 1,
+    "delete-view": 1,
+    "clear-all": 1,
+    "revoke-invite": 1,
+    "reject-request": 1,
+    "chat-delete": 1,
+    "cv-delete-message": 1,
+    "cv-delete-group": 1,
+    "archive-student": 1
+  };
+
+  window.addEventListener("click", function (e) {
+    if (open) return;
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+
+    var t = e.target.closest ? e.target.closest("[data-action]") : null;
+    if (!t) return;
+    if (t.closest("#" + ROOT_ID)) return;
+
+    var a = t.dataset.action;
+    if (!GUARDED[a]) return;
+
+    var id = t.dataset.id;
+
+    if (a === "archive-student") {
+      var s = null;
+      try { s = byId(id); } catch (err) {}
+      if (s && s.archived) return;
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+
+    ask(describe(a, id, t), a, id, { dataset: Object.assign({}, t.dataset) });
+  }, true);
+
+  window.addEventListener("hifz-confirm", function (e) {
+    var d = e.detail || {};
+    if (d.action) ask(describe(d.action, d.id, d.el || { dataset: {} }), d.action, d.id, d.el || { dataset: {} });
+  });
+})();
+</script>       
 </body>
    </html>
