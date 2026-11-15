@@ -5890,5 +5890,490 @@ initCloud();
   setTimeout(mountAll, 2000);
 })();
 </script>   
+<script>
+/* ==========================================================
+   HIFZ · РАЗДЕЛЬНЫЕ ЖУРНАЛЫ
+   Вставь ПЕРЕД </body> ПОСЛЕ всех остальных хотфиксов.
+   У каждого учителя свой журнал. Владелец переключается между всеми.
+   ========================================================== */
+(function () {
+  if (window.__hifzJournals) return;
+  window.__hifzJournals = true;
+
+  var ACTIVE = null;          // null = свой журнал, иначе user_id чужого
+  var JOURNALS = [];
+  var jChannel = null;
+  var loadingList = false;
+
+  function own() { try { return member || null; } catch (e) { return null; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+  function owner() { try { return typeof isOwner === "function" && isOwner(); } catch (e) { return false; } }
+  function E(s) { return typeof esc === "function" ? esc(s) : String(s == null ? "" : s); }
+  function say(m, t) { try { toast(m, { type: t || "info" }); } catch (e) {} }
+  function ico(n, s) { try { return icon(n, s); } catch (e) { return ""; } }
+
+  function journalName(id) {
+    if (!id || (own() && id === own().user_id)) return "Мой журнал";
+    var j = JOURNALS.find(function (x) { return x.user_id === id; });
+    return j ? j.name : "Журнал учителя";
+  }
+
+  function cacheKeyNow() {
+    var m = own();
+    return "hifz-data-v8:" + (m ? m.user_id : "anon") + ":" + (ACTIVE || "self");
+  }
+
+  /* ---------- кэш по журналу ---------- */
+  window.loadCache = function () {
+    try {
+      var raw = JSON.parse(localStorage.getItem(cacheKeyNow()));
+      return validState(raw) ? normalize(raw) : null;
+    } catch (e) { return null; }
+  };
+
+  /* ---------- чтение / запись с учётом журнала ---------- */
+  window.pullState = async function () {
+    sync.status = "syncing";
+    updateSyncUI();
+    var res = await client.rpc("hifz_get_state", { p_owner: ACTIVE });
+    if (res.error) throw res.error;
+    state = normalize(res.data);
+    sync.rev = res.data.rev == null ? 0 : res.data.rev;
+    sync.last = new Date();
+    sync.status = "synced";
+    sync.dirty = false;
+    window.__hifzJournalOwner = res.data.journal_owner || null;
+    try { cacheKey = cacheKeyNow(); } catch (e) {}
+    writeCache();
+    renderAll();
+  };
+
+  window.pushState = async function () {
+    if (!staff()) return;
+    sync.status = "syncing";
+    updateSyncUI();
+    var res = await client.rpc("hifz_save_state", {
+      new_data: payload(),
+      expected_rev: sync.rev,
+      p_owner: ACTIVE
+    });
+    if (res.error) {
+      if (/CONFLICT/i.test(res.error.message || "")) {
+        await window.pullState();
+        say("Журнал обновился на другом устройстве — загружена свежая версия", "info");
+        return;
+      }
+      throw res.error;
+    }
+    sync.rev = res.data.rev;
+    state.meta.updatedAt = res.data.updated_at;
+    sync.last = new Date();
+    sync.dirty = false;
+    sync.status = "synced";
+    writeCache();
+    updateSyncUI();
+  };
+
+  if (typeof window.enterCloud === "function") {
+    var _enter = window.enterCloud;
+    window.enterCloud = async function () {
+      ACTIVE = null;
+      JOURNALS = [];
+      var r = await _enter.apply(this, arguments);
+      if (owner()) loadJournals().catch(function () {});
+      return r;
+    };
+  }
+
+  /* ---------- realtime своего журнала ---------- */
+  var _sub = window.subscribeCloud;
+  var _unsub = window.unsubscribeCloud;
+
+  window.unsubscribeCloud = function () {
+    if (jChannel) { try { client.removeChannel(jChannel); } catch (e) {} jChannel = null; }
+    if (typeof _unsub === "function") _unsub.apply(this, arguments);
+  };
+
+  window.subscribeCloud = function () {
+    if (typeof _sub === "function") _sub.apply(this, arguments);
+    var m = own();
+    if (!client || !m || !staff()) return;
+    var target = ACTIVE || m.user_id;
+    try {
+      jChannel = client.channel("hifz-journal-" + target)
+        .on("postgres_changes",
+          { event: "*", schema: "public", table: "hifz_journals", filter: "owner_id=eq." + target },
+          function (p) {
+            if (p.new && p.new.rev > sync.rev && !sync.dirty) window.pullState().catch(function () {});
+          })
+        .subscribe();
+    } catch (e) {}
+  };
+
+  /* ---------- список журналов ---------- */
+  async function loadJournals() {
+    if (!owner() || loadingList) return;
+    loadingList = true;
+    try {
+      var res = await rpc("hifz_list_journals");
+      if (!res.error) JOURNALS = res.data || [];
+    } catch (e) {} finally { loadingList = false; }
+  }
+
+  /* ---------- кнопка журнала в шапке ---------- */
+  function mountChip() {
+    var host = document.getElementById("topActions");
+    if (!host || !staff()) return;
+    var m = own();
+    if (!m) return;
+
+    var chip = document.getElementById("hjChip");
+    if (!chip) {
+      chip = document.createElement("button");
+      chip.id = "hjChip";
+      chip.className = "chip-btn hj-chip";
+      chip.type = "button";
+      chip.addEventListener("click", function (e) {
+        e.stopPropagation();
+        if (owner()) openJournals(); else openMyInvites();
+      });
+      host.insertBefore(chip, host.firstChild);
+    }
+
+    if (owner()) {
+      chip.innerHTML = ico("book", 15) + "<span>" + E(journalName(ACTIVE)) + "</span>";
+      chip.title = "Переключить журнал";
+      chip.classList.toggle("hj-foreign", !!ACTIVE);
+    } else {
+      chip.innerHTML = ico("mail", 15) + "<span>Приглашения</span>";
+      chip.title = "Пригласить ученицу в свой журнал";
+      chip.classList.remove("hj-foreign");
+    }
+  }
+
+  if (typeof window.renderHeader === "function") {
+    var _rh = window.renderHeader;
+    window.renderHeader = function () {
+      var r = _rh.apply(this, arguments);
+      mountChip();
+      return r;
+    };
+  }
+
+  /* ---------- полоса «чужой журнал» + наставник в команде ---------- */
+  function decorate() {
+    var main = document.getElementById("main");
+    if (main && staff()) {
+      var bar = document.getElementById("hjBanner");
+      if (ACTIVE) {
+        if (!bar) {
+          bar = document.createElement("div");
+          bar.id = "hjBanner";
+          bar.className = "hj-banner";
+          main.insertBefore(bar, main.firstChild);
+        }
+        bar.innerHTML =
+          ico("alert", 16) +
+          "<span>Открыт чужой журнал: <b>" + E(journalName(ACTIVE)) + "</b>. Все изменения сохраняются ему.</span>" +
+          '<button class="btn soft sm" data-action="hj-back-own">Вернуться к своему</button>';
+      } else if (bar) {
+        bar.remove();
+      }
+    }
+
+    if (typeof ui !== "undefined" && ui.view === "team") decorateTeam();
+  }
+
+  function decorateTeam() {
+    var staffList = (typeof team !== "undefined" ? team : []).filter(function (m) {
+      return m.role === "owner" || m.role === "teacher";
+    });
+
+    document.querySelectorAll("[data-member-role]").forEach(function (sel) {
+      var uid = sel.dataset.memberRole;
+      var row = sel.closest(".member-row");
+      if (!row) return;
+      var controls = row.querySelector(".member-controls");
+      if (!controls) return;
+
+      var exist = controls.querySelector('[data-member-mentor="' + uid + '"]');
+      if (sel.value !== "student") { if (exist) exist.remove(); return; }
+      if (exist) return;
+
+      var rec = (typeof team !== "undefined" ? team : []).find(function (m) { return m.user_id === uid; }) || {};
+      var cur = rec.mentor_id || "";
+
+      var s = document.createElement("select");
+      s.className = "mini-select";
+      s.setAttribute("data-member-mentor", uid);
+      s.title = "Чей это журнал";
+      s.innerHTML = '<option value="">Наставник…</option>' + staffList.map(function (m) {
+        return '<option value="' + m.user_id + '"' + (m.user_id === cur ? " selected" : "") + ">" +
+          E(m.name || m.email || "Участник") + "</option>";
+      }).join("");
+
+      var saveBtn = controls.querySelector('[data-action="save-member"]');
+      controls.insertBefore(s, saveBtn || null);
+    });
+  }
+
+  if (typeof window.renderView === "function") {
+    var _rv = window.renderView;
+    window.renderView = function () {
+      var r = _rv.apply(this, arguments);
+      setTimeout(decorate, 30);
+      return r;
+    };
+  }
+
+  document.addEventListener("change", function (e) {
+    if (e.target && e.target.dataset && e.target.dataset.memberRole) setTimeout(decorateTeam, 20);
+  });
+
+  /* ---------- сохранение роли с наставником ---------- */
+  window.saveMember = async function (uid) {
+    var roleSel = document.querySelector('[data-member-role="' + uid + '"]');
+    var linkSel = document.querySelector('[data-member-link="' + uid + '"]');
+    var mentorSel = document.querySelector('[data-member-mentor="' + uid + '"]');
+    if (!roleSel) return;
+
+    var newRole = roleSel.value;
+    var link = newRole === "student" ? (linkSel && linkSel.value ? linkSel.value : null) : null;
+    var mentor = newRole === "student" ? (mentorSel && mentorSel.value ? mentorSel.value : null) : null;
+
+    if (newRole === "student" && link && !mentor) {
+      say("Выбери наставника — в чьём журнале будет эта ученица", "danger");
+      return;
+    }
+
+    try {
+      var res = await rpc("hifz_set_role", {
+        target: uid, new_role: newRole, link_student: link, p_mentor: mentor
+      });
+      if (res.error) throw res.error;
+      await loadTeam();
+      await loadJournals();
+      renderAll();
+      say("Роль и журнал обновлены", "success");
+      try { Sound.play("ok"); } catch (e) {}
+    } catch (err) { say(humanError(err), "danger"); }
+  };
+
+  /* ---------- переключатель журналов (владелец) ---------- */
+  async function openJournals() {
+    await loadJournals();
+    var m = own();
+
+    var rows = JOURNALS.map(function (j) {
+      var active = (j.user_id === (ACTIVE || m.user_id));
+      return '<button class="hj-row' + (active ? " active" : "") + '" data-action="hj-switch" data-id="' + j.user_id + '">' +
+        '<span class="avatar sm">' + E(initials(j.name)) + "</span>" +
+        '<span class="hj-row-main"><b>' + E(j.name) + "</b>" +
+        "<small>" + (j.role === "owner" ? "Владелец" : "Учитель") + " · " +
+          j.students + " учениц · " + j.passages + " отрывков</small></span>" +
+        (active ? '<span class="hj-here">открыт</span>' : "") +
+      "</button>";
+    }).join("");
+
+    var students = (state.students || []).filter(function (s) { return !s.archived; });
+
+    openDrawer(
+      '<button class="drawer-x" data-action="drawer-close">' + ico("x", 15) + "</button>" +
+      "<h3>Журналы команды</h3>" +
+      '<p class="drawer-note">У каждого учителя свой журнал. Владелец может открыть любой и работать в нём.</p>' +
+      '<div class="hj-list">' + (rows || '<div class="empty-list">Пока никого.</div>') + "</div>" +
+      '<div class="drawer-section"><h4>Перенести ученицу</h4>' +
+        '<p class="drawer-note">Ученица, её отрывки и история переедут в другой журнал.</p>' +
+        '<form id="hjTransferForm">' +
+          '<label class="field">Ученица из журнала «' + E(journalName(ACTIVE)) + '»' +
+            '<select name="student" required>' +
+              '<option value="">Выбрать…</option>' +
+              students.map(function (s) { return '<option value="' + s.id + '">' + E(s.name) + "</option>"; }).join("") +
+            "</select></label>" +
+          '<label class="field">Кому передать<select name="to" required>' +
+            '<option value="">Выбрать…</option>' +
+            JOURNALS.filter(function (j) { return j.user_id !== (ACTIVE || m.user_id); })
+              .map(function (j) { return '<option value="' + j.user_id + '">' + E(j.name) + "</option>"; }).join("") +
+          "</select></label>" +
+          '<button class="btn primary block" type="submit">' + ico("upload", 15) + " Перенести</button>" +
+        "</form>" +
+      "</div>"
+    );
+  }
+
+  async function switchJournal(id) {
+    var m = own();
+    ACTIVE = (!id || id === m.user_id) ? null : id;
+    try { ui.studentId = null; ui.view = "today"; ui.selected.clear(); } catch (e) {}
+    closeDrawer();
+    try {
+      await window.pullState();
+      window.subscribeCloud();
+      renderAll();
+      say(ACTIVE ? "Открыт журнал: " + journalName(ACTIVE) : "Вы в своём журнале", "info");
+    } catch (err) { say(humanError(err), "danger"); }
+  }
+
+  /* ---------- приглашения для любого учителя ---------- */
+  async function openMyInvites() {
+    var mine = [];
+    try {
+      var res = await client.from("hifz_invites").select("*").order("created_at", { ascending: false });
+      if (!res.error) mine = res.data || [];
+    } catch (e) {}
+
+    var m = own();
+    var canTeacher = owner();
+    var students = (state.students || []).filter(function (s) { return !s.archived; });
+
+    openDrawer(
+      '<button class="drawer-x" data-action="drawer-close">' + ico("x", 15) + "</button>" +
+      "<h3>Приглашения в мой журнал</h3>" +
+      '<p class="drawer-note">Ученица, зарегистрированная по этому коду, автоматически попадёт в журнал «' +
+        E(m ? m.name : "Мой журнал") + "».</p>" +
+      '<form id="hjInviteForm">' +
+        '<label class="field">Кого приглашаем<select name="role">' +
+          '<option value="student">Ученицу</option>' +
+          (canTeacher ? '<option value="teacher">Учителя</option>' : "") +
+        "</select></label>" +
+        '<label class="field">Привязать к карточке<select name="student">' +
+          '<option value="">Выбрать позже</option>' +
+          students.map(function (s) { return '<option value="' + s.id + '">' + E(s.name) + "</option>"; }).join("") +
+        "</select></label>" +
+        '<label class="field">Заметка<input name="note" maxlength="80" placeholder="Например: Амина, вечерняя"></label>' +
+        '<button class="btn primary block" type="submit">' + ico("plus", 15) + " Создать код</button>" +
+      "</form>" +
+      '<div class="drawer-section"><h4>Мои коды</h4>' +
+        (mine.length
+          ? mine.map(function (v) {
+              return '<div class="invite-row"><span class="invite-code">' + E(v.code) + "</span>" +
+                "<span>" + (v.role === "teacher" ? "Учитель" : "Ученица") + "</span>" +
+                '<span class="sub" style="margin:0">' + (v.used_by ? "использован" : "активен") + "</span>" +
+                '<button class="icon-btn" data-action="hj-copy" data-code="' + E(v.code) + '">' + ico("copy", 13) + "</button>" +
+                (!v.used_by ? '<button class="icon-btn" data-action="hj-revoke" data-code="' + E(v.code) + '">' + ico("trash", 13) + "</button>" : "") +
+              "</div>";
+            }).join("")
+          : '<div class="empty-list" style="padding:14px">Кодов пока нет.</div>') +
+      "</div>"
+    );
+  }
+
+  /* ---------- обработчики ---------- */
+  window.addEventListener("click", async function (e) {
+    var t = e.target.closest ? e.target.closest("[data-action]") : null;
+    if (!t) return;
+    var a = t.dataset.action;
+
+    if (a === "hj-switch") {
+      e.preventDefault(); e.stopPropagation();
+      await switchJournal(t.dataset.id);
+      return;
+    }
+    if (a === "hj-back-own") {
+      e.preventDefault(); e.stopPropagation();
+      await switchJournal(null);
+      return;
+    }
+    if (a === "hj-copy") {
+      e.preventDefault(); e.stopPropagation();
+      try { await navigator.clipboard.writeText(t.dataset.code); say("Код скопирован", "success"); } catch (err) {}
+      return;
+    }
+    if (a === "hj-revoke") {
+      e.preventDefault(); e.stopPropagation();
+      try {
+        var r = await rpc("hifz_revoke_invite", { inv_code: t.dataset.code });
+        if (r.error) throw r.error;
+        await openMyInvites();
+        say("Код отозван", "info");
+      } catch (err) { say(humanError(err), "danger"); }
+      return;
+    }
+  }, true);
+
+  document.addEventListener("submit", async function (e) {
+    var f = e.target;
+
+    if (f.id === "hjInviteForm") {
+      e.preventDefault(); e.stopPropagation();
+      try {
+        var F = f.elements;
+        var res = await rpc("hifz_create_invite", {
+          inv_role: F.role.value,
+          link_student: F.student.value || null,
+          inv_note: F.note.value.trim() || null
+        });
+        if (res.error) throw res.error;
+        await openMyInvites();
+        say("Код: " + res.data, "success");
+        try { Sound.play("save"); } catch (err) {}
+      } catch (err) { say(humanError(err), "danger"); }
+      return;
+    }
+
+    if (f.id === "hjTransferForm") {
+      e.preventDefault(); e.stopPropagation();
+      try {
+        var G = f.elements;
+        var sid = G.student.value;
+        var to = G.to.value;
+        if (!sid || !to) return;
+        var m = own();
+        var from = ACTIVE || m.user_id;
+        var r = await rpc("hifz_transfer_student", { p_student_id: sid, p_from: from, p_to: to });
+        if (r.error) throw r.error;
+        await loadJournals();
+        await window.pullState();
+        window.subscribeCloud();
+        closeDrawer();
+        renderAll();
+        say("Ученица перенесена в другой журнал", "success");
+      } catch (err) { say(humanError(err), "danger"); }
+      return;
+    }
+  }, true);
+
+  /* ---------- стили ---------- */
+  if (!document.getElementById("hj-css")) {
+    var st = document.createElement("style");
+    st.id = "hj-css";
+    st.textContent = [
+      ".hj-chip{max-width:190px}",
+      ".hj-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".hj-chip.hj-foreign{border-color:var(--amber-line);color:var(--amber);background:var(--amber-soft)}",
+      ".hj-banner{display:flex;align-items:center;gap:10px;flex-wrap:wrap;",
+      "  background:var(--amber-soft);border:1px solid var(--amber-line);color:var(--amber);",
+      "  border-radius:13px;padding:11px 15px;margin-bottom:16px;font-size:12.5px;font-weight:700}",
+      ".hj-banner span{flex:1;min-width:180px}",
+      ".hj-banner .btn{margin-left:auto}",
+      ".hj-list{display:flex;flex-direction:column;gap:6px}",
+      ".hj-row{display:flex;align-items:center;gap:11px;width:100%;border:1px solid var(--line);",
+      "  background:var(--surface2);cursor:pointer;padding:10px 12px;border-radius:13px;text-align:left;transition:.15s}",
+      ".hj-row:hover{border-color:var(--blue);background:var(--blue-soft)}",
+      ".hj-row.active{border-color:var(--blue);background:var(--blue-soft)}",
+      ".hj-row-main{flex:1;min-width:0}",
+      ".hj-row-main b{display:block;font-size:13px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".hj-row-main small{display:block;font-size:11px;color:var(--muted);font-weight:600;margin-top:2px}",
+      ".hj-here{font-size:10px;font-weight:800;color:var(--blue);background:var(--surface);",
+      "  border:1px solid var(--line2);padding:3px 8px;border-radius:8px;flex:none}",
+      "@media(max-width:700px){.hj-chip span{display:none}.hj-chip{padding:8px}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- старт ---------- */
+  (async function () {
+    var m = own();
+    if (!m || !staff()) return;
+    if (owner()) await loadJournals();
+    mountChip();
+    decorate();
+    window.subscribeCloud();
+  })();
+
+  setTimeout(function () { mountChip(); decorate(); }, 900);
+  setTimeout(function () { mountChip(); decorate(); }, 2500);
+})();
+     </script>   
 </body>
    </html>
