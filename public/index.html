@@ -5756,5 +5756,139 @@ initCloud();
   });
 })();
 </script>       
+<script>
+/* ==========================================================
+   HIFZ · ССЫЛКА НА КАНАЛ KORANVDOM
+   Вставь ПЕРЕД </body> после всех остальных хотфиксов.
+   Кнопка появляется под логотипом в шапке (видна и на экране входа)
+   + кликабельный KoranVdom в подвале.
+   ========================================================== */
+(function () {
+  if (window.__hifzTgChannel) return;
+  window.__hifzTgChannel = true;
+
+  var TG_URL = "https://t.me/KoranVdom";
+
+  var PLANE =
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
+    '<path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/>' +
+    '</svg>';
+
+  /* ---------- стили ---------- */
+  if (!document.getElementById("hifz-tg-css")) {
+    var st = document.createElement("style");
+    st.id = "hifz-tg-css";
+    st.textContent = [
+      ".tg-channel{",
+      "  display:inline-flex;align-items:center;gap:5px;width:max-content;",
+      "  margin-top:5px;padding:3px 9px 3px 7px;border-radius:9px;",
+      "  background:linear-gradient(135deg,#2AABEE,#229ED9);color:#fff;",
+      "  font-size:10.5px;font-weight:800;letter-spacing:.2px;line-height:1.5;",
+      "  text-decoration:none;white-space:nowrap;",
+      "  box-shadow:0 3px 10px rgba(34,158,217,.34);",
+      "  transition:transform .16s,box-shadow .16s,filter .16s;",
+      "}",
+      ".tg-channel:hover{transform:translateY(-1px);filter:brightness(1.08);box-shadow:0 7px 18px rgba(34,158,217,.45)}",
+      ".tg-channel:active{transform:scale(.96)}",
+      ".tg-channel:focus-visible{outline:2px solid #229ED9;outline-offset:3px}",
+      ".tg-channel svg{flex:none;transition:transform .2s cubic-bezier(.2,.7,.3,1.4)}",
+      ".tg-channel:hover svg{transform:translateX(2px) rotate(-10deg)}",
+      ".tg-channel i{",
+      "  font-style:normal;width:5px;height:5px;border-radius:50%;background:#fff;",
+      "  opacity:.85;animation:tgPulse 2.2s ease-in-out infinite",
+      "}",
+      "@keyframes tgPulse{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}",
+      ".tg-foot{color:var(--blue,#1a6fd6);font-weight:800;text-decoration:none;",
+      "  border-bottom:1px dotted currentColor;transition:.15s}",
+      ".tg-foot:hover{filter:brightness(1.15);border-bottom-style:solid}",
+      "@media(max-width:700px){.tg-channel{margin-top:4px;font-size:10px;padding:3px 8px 3px 6px}}",
+      "@media(prefers-reduced-motion:reduce){.tg-channel i{animation:none}.tg-channel,.tg-channel svg{transition:none}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- кнопка под логотипом ---------- */
+  function buildButton() {
+    var a = document.createElement("a");
+    a.id = "tgChannelLink";
+    a.className = "tg-channel";
+    a.href = TG_URL;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = "Telegram-канал KoranVdom";
+    a.setAttribute("aria-label", "Открыть Telegram-канал KoranVdom");
+    a.innerHTML = PLANE + "<span>KoranVdom</span><i></i>";
+
+    /* клик по кнопке не должен уводить на главную через .brand */
+    a.addEventListener("click", function (e) { e.stopPropagation(); });
+    a.addEventListener("mousedown", function (e) { e.stopPropagation(); });
+    a.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+    });
+    return a;
+  }
+
+  function mountButton() {
+    if (document.getElementById("tgChannelLink")) return;
+
+    var brand = document.querySelector(".topbar .brand") || document.querySelector(".brand");
+    if (brand) {
+      var text = brand.lastElementChild;
+      if (text && text.tagName === "SPAN") {
+        text.appendChild(buildButton());
+        return;
+      }
+      brand.appendChild(buildButton());
+      return;
+    }
+
+    var inner = document.querySelector(".topbar-inner");
+    if (inner) inner.appendChild(buildButton());
+  }
+
+  /* ---------- кликабельный KoranVdom в подвале ---------- */
+  function mountFooter() {
+    var credit = document.querySelector("footer .credit");
+    if (!credit || credit.querySelector("a")) return;
+    var txt = credit.textContent || "";
+    if (txt.indexOf("KoranVdom") === -1) return;
+
+    var safe = String(txt).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+
+    credit.innerHTML = safe.replace(
+      "KoranVdom",
+      '<a class="tg-foot" href="' + TG_URL + '" target="_blank" rel="noopener noreferrer">KoranVdom</a>'
+    );
+
+    var link = credit.querySelector("a");
+    if (link) link.addEventListener("click", function (e) { e.stopPropagation(); });
+  }
+
+  function mountAll() {
+    mountButton();
+    mountFooter();
+  }
+
+  /* шапка перерисовывается — подстрахуемся */
+  if (typeof window.renderHeader === "function") {
+    var _renderHeader = window.renderHeader;
+    window.renderHeader = function () {
+      var r = _renderHeader.apply(this, arguments);
+      mountAll();
+      return r;
+    };
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", mountAll);
+  } else {
+    mountAll();
+  }
+  setTimeout(mountAll, 600);
+  setTimeout(mountAll, 2000);
+})();
+</script>   
 </body>
    </html>
