@@ -7628,5 +7628,85 @@ initCloud();
   setTimeout(injectEntry, 1200);
 })();
 </script>
+   <script>
+/* ==========================================================
+   SOLO MODE TOGGLE — вставить ПЕРЕД </body>, после остальных
+   ========================================================== */
+(function () {
+  if (window.__hifzSolo) return;
+  window.__hifzSolo = true;
+
+  var solo = false, loaded = false;
+
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+
+  async function load() {
+    var m = mem(); if (!m) return;
+    try {
+      var r = await client.from("hifz_push_prefs").select("solo").eq("user_id", m.user_id).maybeSingle();
+      solo = !!(r.data && r.data.solo);
+      loaded = true;
+    } catch (e) { loaded = true; }
+  }
+
+  async function save(v) {
+    var m = mem(); if (!m) return;
+    solo = v;
+    var r = await client.from("hifz_push_prefs").upsert({
+      user_id: m.user_id, solo: v, updated_at: new Date().toISOString()
+    });
+    if (r.error) { solo = !v; say("Не удалось сохранить", "danger"); }
+    else say(v ? "Тестовый режим включён — свои сообщения тоже придут" : "Тестовый режим выключен", "info");
+    paint();
+  }
+
+  function paint() {
+    var hp = document.getElementById("hpBody");
+    if (!hp) return;
+    var box = document.getElementById("soloBox");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "soloBox";
+      box.className = "solo-box";
+      hp.appendChild(box);
+    }
+    box.innerHTML =
+      '<div class="solo-head"><b>Тестовый режим</b><span class="' + (solo ? "on" : "") + '">' + (solo ? "включён" : "выключен") + '</span></div>' +
+      '<p>Обычно уведомления чата уходят только другим участникам — себя не уведомляют. Если ты пока один в журнале, включи этот режим, чтобы получать и свои сообщения для проверки.</p>' +
+      '<label class="solo-toggle"><input type="checkbox" id="soloChk" ' + (solo ? "checked" : "") + '><i></i><span>Получать свои сообщения</span></label>';
+    var chk = document.getElementById("soloChk");
+    if (chk) chk.onchange = function () { save(chk.checked); };
+  }
+
+  if (!document.getElementById("solo-css")) {
+    var st = document.createElement("style");
+    st.id = "solo-css";
+    st.textContent = [
+      ".solo-box{margin-top:16px;padding:14px;border-radius:14px;background:var(--surface2);border:1px dashed var(--line2)}",
+      ".solo-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}",
+      ".solo-head b{font-size:13px;font-weight:800}",
+      ".solo-head span{font-size:10.5px;font-weight:800;padding:3px 9px;border-radius:9px;background:var(--surface3);color:var(--muted)}",
+      ".solo-head span.on{background:var(--green-soft);color:var(--green)}",
+      ".solo-box p{font-size:12px;font-weight:500;line-height:1.6;color:var(--muted);margin-bottom:11px}",
+      ".solo-toggle{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12.5px;font-weight:700}",
+      ".solo-toggle input{position:absolute;opacity:0;width:1px;height:1px;min-height:0}",
+      ".solo-toggle i{width:38px;height:22px;border-radius:11px;background:var(--line2);position:relative;transition:.2s;flex:none}",
+      ".solo-toggle i::after{content:'';position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.2s}",
+      ".solo-toggle input:checked+i{background:linear-gradient(135deg,var(--blue3),var(--blue2))}",
+      ".solo-toggle input:checked+i::after{transform:translateX(16px)}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  var mo = new MutationObserver(function () {
+    if (document.getElementById("hpBody")) {
+      if (!loaded) load().then(paint);
+      else paint();
+    }
+  });
+  mo.observe(document.body, { childList: true, subtree: true });
+})();
+   </script>
 </body>
    </html>
