@@ -6904,173 +6904,729 @@ initCloud();
   })();
 })();
    </script>
-   -- ============================================================
---  PUSH DIAGNOSTICS · серверная часть
---  Supabase → SQL Editor → New query → Run
---  Ничего не удаляет, только добавляет функции чтения.
--- ============================================================
+<script>
+/* ==========================================================
+   HIFZ PUSH DIAGNOSTICS
+   Вставить ПОСЛЕ всех остальных хотфиксов и ПЕРЕД </body>.
+   Показывает, на каком звене теряются уведомления.
+   ========================================================== */
+(function () {
+  if (window.__hifzPushDiag) return;
+  window.__hifzPushDiag = true;
 
-create or replace function public.hifz_push_diag()
-returns jsonb
-language plpgsql security definer set search_path = public
-as $$
-declare
-  uid uuid := auth.uid();
-  cfg text;
-  sec text;
-  v_subs jsonb;
-  v_prefs jsonb;
-  v_logs jsonb;
-  v_trig int;
-  v_job int;
-  v_msgs int;
-  v_members int;
-begin
-  if uid is null then raise exception 'NO_AUTH'; end if;
-  if not public.hifz_is_staff() then raise exception 'FORBIDDEN'; end if;
+  var D = {
+    open: false,
+    server: null,
+    client: null,
+    stages: [],
+    busy: false,
+    auto: false,
+    every: 15,
+    onlyBad: false,
+    sound: true,
+    timer: null,
+    detail: null,
+    lastFlow: 0,
+    logsOpen: {}
+  };
 
-  select vapid_public into cfg from public.hifz_push_config where id = 1;
+  var AC = null;
+  function tone(f, dur, gain, slide) {
+    if (!D.sound) return;
+    try {
+      if (typeof prefs !== "undefined" && prefs.sound === false) return;
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === "suspended") AC.resume();
+      var t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f, t);
+      if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(AC.destination); o.start(t); o.stop(t + dur + 0.04);
+    } catch (e) {}
+  }
+  function sfx(kind) {
+    if (kind === "good") { tone(660, 0.1, 0.05); setTimeout(function () { tone(990, 0.16, 0.045); }, 90); }
+    if (kind === "bad") { tone(240, 0.16, 0.05, 170); }
+    if (kind === "tick") { tone(520, 0.05, 0.028); }
+    if (kind === "send") { tone(440, 0.09, 0.045, 720); }
+  }
 
-  begin
-    select decrypted_secret into sec
-    from vault.decrypted_secrets where name = 'hifz_push_secret' limit 1;
-  exception when others then sec := null;
-  end;
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+  function herr(e) { try { return humanError(e); } catch (x) { return String((e && e.message) || e); } }
 
-  select coalesce(jsonb_agg(jsonb_build_object(
-    'endpoint', endpoint,
-    'platform', platform,
-    'created_at', created_at,
-    'seen_at', seen_at,
-    'p256dh_len', length(p256dh),
-    'auth_len', length(auth)
-  ) order by created_at desc), '[]'::jsonb)
-  into v_subs
-  from public.hifz_push_subs where user_id = uid;
+  function b64url(buf) {
+    var b = new Uint8Array(buf), s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromB64url(s) {
+    var pad = "=".repeat((4 - s.length % 4) % 4);
+    var raw = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function hhmm(ts) {
+    try { return fmtTime.format(new Date(ts)); } catch (e) { return String(ts || "").slice(11, 16); }
+  }
+  function ago(ts) {
+    if (!ts) return "—";
+    var s = Math.max(0, Math.round((Date.now() - new Date(ts).getTime()) / 1000));
+    if (s < 60) return s + " с назад";
+    if (s < 3600) return Math.floor(s / 60) + " мин назад";
+    return Math.floor(s / 3600) + " ч назад";
+  }
 
-  select to_jsonb(p) into v_prefs from public.hifz_push_prefs p where user_id = uid;
+  /* ---------- сбор фактов ---------- */
+  async function collect() {
+    var c = {
+      supported: "serviceWorker" in navigator && "PushManager" in window && "Notification" in window,
+      secure: location.protocol === "https:" || location.hostname === "localhost",
+      standalone: window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true,
+      ios: /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1),
+      perm: "Notification" in window ? Notification.permission : "unsupported",
+      reg: false, swActive: false, sub: false, subKey: "", endpoint: "", err: null
+    };
+    try {
+      if (c.supported) {
+        var reg = await navigator.serviceWorker.getRegistration("/");
+        c.reg = !!reg;
+        c.swActive = !!(reg && reg.active);
+        if (reg) {
+          var sub = await reg.pushManager.getSubscription();
+          c.sub = !!sub;
+          if (sub) {
+            c.endpoint = sub.endpoint;
+            var k = sub.options && sub.options.applicationServerKey;
+            if (k) c.subKey = b64url(k);
+          }
+        }
+      }
+    } catch (e) { c.err = String(e && e.message || e); }
 
-  select count(*) into v_trig from pg_trigger where tgname like 'hifz_push%';
+    var s = null;
+    try {
+      var r = await rpc("hifz_push_diag");
+      if (r.error) c.serverErr = herr(r.error);
+      else s = r.data;
+    } catch (e) { c.serverErr = herr(e); }
 
-  begin
-    select count(*) into v_job from cron.job where jobname = 'hifz-daily-review-push';
-  exception when others then v_job := 0;
-  end;
+    D.client = c;
+    D.server = s;
+    evaluate();
+  }
 
-  select count(*) into v_msgs from public.hifz_chat_messages;
-  select count(*) into v_members from public.hifz_conversation_members where user_id = uid;
+  function stage(id, label, state, note, fix, hint) {
+    return { id: id, label: label, state: state, note: note, fix: fix || null, hint: hint || "" };
+  }
 
-  begin
-    select coalesce(jsonb_agg(jsonb_build_object(
-      'status', status_code,
-      'error', error_msg,
-      'timed_out', timed_out,
-      'created', created,
-      'body', left(coalesce(content, ''), 400)
-    ) order by created desc), '[]'::jsonb)
-    into v_logs
-    from (select * from net._http_response order by created desc limit 15) t;
-  exception when others then v_logs := '[]'::jsonb;
-  end;
+  function evaluate() {
+    var c = D.client || {}, s = D.server || {};
+    var out = [];
 
-  return jsonb_build_object(
-    'config_key_set', (cfg is not null and length(cfg) > 40),
-    'config_key_len', coalesce(length(cfg), 0),
-    'config_key', coalesce(cfg, ''),
-    'secret_set', (sec is not null and sec <> 'PUSH_SECRET_VALUE'),
-    'secret_len', coalesce(length(sec), 0),
-    'subs', v_subs,
-    'prefs', coalesce(v_prefs, '{}'::jsonb),
-    'triggers', v_trig,
-    'cron', v_job,
-    'messages', v_msgs,
-    'memberships', v_members,
-    'http_logs', v_logs,
-    'server_now', now()
-  );
-end;
-$$;
+    out.push(stage("env", "Браузер",
+      !c.supported ? (c.ios && !c.standalone ? "warn" : "bad") : (!c.secure ? "bad" : "ok"),
+      !c.supported
+        ? (c.ios && !c.standalone ? "iOS: нужно установить на домашний экран" : "Push не поддерживается")
+        : (!c.secure ? "Нужен HTTPS" : "Push API доступен"),
+      !c.supported && c.ios ? "install" : null,
+      "Service Worker и PushManager должны быть доступны. На iPhone это работает только из установленного приложения."));
 
-grant execute on function public.hifz_push_diag() to authenticated;
+    out.push(stage("perm", "Разрешение",
+      c.perm === "granted" ? "ok" : c.perm === "denied" ? "bad" : "warn",
+      c.perm === "granted" ? "Пользователь разрешил" : c.perm === "denied" ? "Заблокировано в браузере" : "Ещё не спрашивали",
+      c.perm !== "granted" ? "ask" : null,
+      "Без разрешения системы уведомления не покажутся. Если статус denied — сбрось запрет через замок в адресной строке."));
 
--- проверка канала отправки: показывает, дойдёт ли запрос до edge-функции
-create or replace function public.hifz_push_probe()
-returns jsonb
-language plpgsql security definer set search_path = public
-as $$
-declare
-  uid uuid := auth.uid();
-  sec text;
-  can boolean;
-  n_subs int;
-begin
-  if uid is null then raise exception 'NO_AUTH'; end if;
+    out.push(stage("sub", "Подписка",
+      c.sub ? "ok" : "bad",
+      c.sub ? "PushSubscription активна" : "Устройство не подписано",
+      c.sub ? null : "resub",
+      "Браузер регистрирует устройство в push-сервисе Google/Apple и выдаёт endpoint."));
 
-  begin
-    select decrypted_secret into sec
-    from vault.decrypted_secrets where name = 'hifz_push_secret' limit 1;
-  exception when others then sec := null;
-  end;
+    var keySet = !!s.config_key_set;
+    out.push(stage("dbkey", "Ключ в базе",
+      keySet ? "ok" : "bad",
+      keySet ? (s.config_key_len + " символов") : "hifz_push_config пустой",
+      keySet ? null : "syncKey",
+      "Публичный VAPID-ключ должен лежать в таблице hifz_push_config — оттуда его читает браузер."));
 
-  can := (sec is not null and sec <> 'PUSH_SECRET_VALUE');
-  select count(*) into n_subs from public.hifz_push_subs where user_id = uid;
+    var match = c.sub && keySet && c.subKey && c.subKey === s.config_key;
+    out.push(stage("match", "Ключ совпадает",
+      !c.sub || !keySet ? "idle" : (match ? "ok" : "bad"),
+      !c.sub || !keySet ? "Нечего сравнивать" : match ? "Подписка и база согласованы" : "Подписка сделана другим ключом",
+      c.sub && keySet && !match ? "resub" : null,
+      "Если браузер подписан старым ключом, а сервер шлёт новым — push отклоняется. Нужна переподписка."));
 
-  if can then
-    perform public.hifz_push_send(jsonb_build_object('type', 'test', 'user_id', uid));
-  end if;
+    var rows = s.subs || [];
+    var saved = rows.some(function (r) { return r.endpoint === c.endpoint; });
+    out.push(stage("row", "Запись в базе",
+      !c.sub ? "idle" : saved ? "ok" : "bad",
+      !c.sub ? "Нет подписки" : saved ? ("Устройств: " + rows.length) : "Endpoint не сохранён",
+      c.sub && !saved ? "saveRow" : null,
+      "Подписка должна быть в hifz_push_subs, иначе рассылка не знает, куда слать."));
 
-  return jsonb_build_object(
-    'dispatched', can,
-    'subscriptions', n_subs,
-    'reason', case
-      when not can then 'Секрет не задан в базе — триггеры молчат'
-      when n_subs = 0 then 'Нет подписок — слать некуда'
-      else null
-    end
-  );
-end;
-$$;
+    out.push(stage("secret", "Секрет сервера",
+      s.secret_set ? "ok" : "bad",
+      s.secret_set ? (s.secret_len + " символов") : "Vault пуст или placeholder",
+      s.secret_set ? null : "secret",
+      "Триггеры читают секрет из Vault. Без них запрос к edge-функции не отправляется вообще."));
 
-grant execute on function public.hifz_push_probe() to authenticated;
+    var logs = s.http_logs || [];
+    var last = logs[0];
+    var fnState = "idle", fnNote = "Вызовов ещё не было";
+    if (last) {
+      if (last.error || last.timed_out) { fnState = "bad"; fnNote = "Сеть: " + (last.error || "timeout"); }
+      else if (last.status === 200) { fnState = "ok"; fnNote = "200 OK · " + ago(last.created); }
+      else if (last.status === 401) { fnState = "bad"; fnNote = "401 — PUSH_SECRET не совпадает"; }
+      else if (last.status === 404) { fnState = "bad"; fnNote = "404 — функция не задеплоена"; }
+      else if (last.status === 500) { fnState = "bad"; fnNote = "500 — нет VAPID-ключей в Secrets"; }
+      else { fnState = "warn"; fnNote = last.status + " · " + ago(last.created); }
+    }
+    out.push(stage("edge", "Edge-функция", fnState, fnNote, null,
+      "Последний ответ функции рассылки. 200 — доставлено, 401 — секрет, 404 — нет функции, 500 — нет ключей."));
 
--- отправить настоящее сообщение в общий чат (проверка всей цепочки триггеров)
-create or replace function public.hifz_push_probe_chat()
-returns jsonb
-language plpgsql security definer set search_path = public
-as $$
-declare
-  uid uuid := auth.uid();
-  gid uuid;
-  mid uuid;
-  m public.hifz_members;
-begin
-  if uid is null then raise exception 'NO_AUTH'; end if;
-  if not public.hifz_is_staff() then raise exception 'FORBIDDEN'; end if;
+    var prefChat = !s.prefs || s.prefs.chat !== false;
+    out.push(stage("prefs", "Тип «Чат»",
+      prefChat ? "ok" : "warn",
+      prefChat ? "Включён" : "Выключен в настройках",
+      prefChat ? null : "enableChat",
+      "В личных настройках уведомлений тип «Сообщения чата» должен быть включён."));
 
-  select * into m from public.hifz_members where user_id = uid;
-  if not found then raise exception 'NO_MEMBER'; end if;
+    var quiet = s.prefs && s.prefs.quiet_on;
+    var inQuiet = false;
+    if (quiet) {
+      var off = (s.prefs.tz_offset || 0);
+      var now = new Date(Date.now() + off * 60000);
+      var cur = now.getUTCHours() * 60 + now.getUTCMinutes();
+      var f = String(s.prefs.quiet_from || "23:00").split(":").map(Number);
+      var t = String(s.prefs.quiet_to || "07:00").split(":").map(Number);
+      var from = f[0] * 60 + f[1], to = t[0] * 60 + t[1];
+      inQuiet = from <= to ? (cur >= from && cur < to) : (cur >= from || cur < to);
+    }
+    out.push(stage("quiet", "Тихие часы",
+      !quiet ? "ok" : inQuiet ? "warn" : "ok",
+      !quiet ? "Отключены" : inQuiet ? ("Сейчас тихо до " + s.prefs.quiet_to) : ("Сейчас можно · " + s.prefs.quiet_from + "–" + s.prefs.quiet_to),
+      inQuiet ? "quietOff" : null,
+      "В тихие часы рассылка молчит намеренно — это не поломка."));
 
-  select id into gid from public.hifz_conversations where is_general limit 1;
-  if gid is null then
-    gid := public.hifz_ensure_general_conversation();
-  end if;
+    out.push(stage("trig", "Триггеры",
+      (s.triggers || 0) >= 3 ? "ok" : "bad",
+      (s.triggers || 0) + " шт.",
+      null,
+      "Триггер на hifz_chat_messages отправляет push при каждом новом сообщении."));
 
-  insert into public.hifz_conversation_members (conversation_id, user_id)
-  values (gid, uid) on conflict do nothing;
+    D.stages = out;
+  }
 
-  insert into public.hifz_chat_messages
-    (conversation_id, user_id, author_name, author_role, body)
-  values
-    (gid, uid, coalesce(m.name, 'Диагностика'), m.role,
-     '🔔 Проверка доставки уведомлений · ' || to_char(now(), 'HH24:MI:SS'))
-  returning id into mid;
+  function health() {
+    var bad = D.stages.filter(function (s) { return s.state === "bad"; }).length;
+    var warn = D.stages.filter(function (s) { return s.state === "warn"; }).length;
+    if (bad) return { key: "bad", label: "Цепочка разорвана", n: bad };
+    if (warn) return { key: "warn", label: "Есть предупреждения", n: warn };
+    return { key: "ok", label: "Всё готово к доставке", n: 0 };
+  }
 
-  update public.hifz_conversations set updated_at = now() where id = gid;
+  /* ---------- исправления ---------- */
+  async function runFix(kind) {
+    D.busy = true; paint();
+    try {
+      if (kind === "ask" || kind === "resub" || kind === "saveRow") {
+        var reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+        await navigator.serviceWorker.ready;
+        var perm = await Notification.requestPermission();
+        if (perm !== "granted") throw new Error("Разрешение не выдано");
 
-  return jsonb_build_object('message_id', mid, 'conversation_id', gid);
-end;
-$$;
+        var s = D.server || {};
+        if (!s.config_key) throw new Error("Сначала задай публичный ключ в базе");
 
-grant execute on function public.hifz_push_probe_chat() to authenticated;
+        var old = await reg.pushManager.getSubscription();
+        if (old && kind === "resub") { await old.unsubscribe().catch(function () {}); old = null; }
+
+        var sub = old || await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: fromB64url(s.config_key)
+        });
+
+        var j = sub.toJSON();
+        var m = mem();
+        var r = await client.from("hifz_push_subs").upsert({
+          endpoint: j.endpoint, user_id: m.user_id,
+          p256dh: j.keys.p256dh, auth: j.keys.auth,
+          ua: navigator.userAgent.slice(0, 240),
+          platform: /iPad|iPhone|iPod/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : "Desktop",
+          seen_at: new Date().toISOString()
+        }, { onConflict: "endpoint" });
+        if (r.error) throw r.error;
+        say("Подписка обновлена"); sfx("good");
+      }
+
+      if (kind === "syncKey") {
+        var reg2 = await navigator.serviceWorker.getRegistration("/");
+        var sub2 = reg2 ? await reg2.pushManager.getSubscription() : null;
+        if (!sub2 || !sub2.options.applicationServerKey) throw new Error("Нет подписки, откуда взять ключ");
+        var k = b64url(sub2.options.applicationServerKey);
+        var u = await client.from("hifz_push_config").update({ vapid_public: k, updated_at: new Date().toISOString() }).eq("id", 1);
+        if (u.error) throw u.error;
+        say("Ключ из подписки записан в базу. Обнови VAPID_PUBLIC_KEY в Secrets тем же значением.", "info");
+        sfx("good");
+      }
+
+      if (kind === "enableChat" || kind === "quietOff") {
+        var m2 = mem();
+        var patch = { user_id: m2.user_id, updated_at: new Date().toISOString() };
+        if (kind === "enableChat") patch.chat = true;
+        if (kind === "quietOff") patch.quiet_on = false;
+        var q = await client.from("hifz_push_prefs").upsert(patch);
+        if (q.error) throw q.error;
+        say("Настройка изменена"); sfx("tick");
+      }
+
+      if (kind === "secret") {
+        say("Секрет задаётся только через SQL — скопирован запрос в буфер", "info");
+        await navigator.clipboard.writeText(
+          "do $$\ndeclare ns text; sid uuid;\nbegin\n  ns := encode(gen_random_bytes(32),'hex');\n  select id into sid from vault.secrets where name='hifz_push_secret';\n  if sid is null then perform vault.create_secret(ns,'hifz_push_secret');\n  else perform vault.update_secret(sid, ns); end if;\nend $$;\n\nselect decrypted_secret as copy_to_push_secret from vault.decrypted_secrets where name='hifz_push_secret';"
+        );
+      }
+
+      if (kind === "install") {
+        say("Safari → Поделиться → На экран «Домой» → открой иконку", "info");
+      }
+
+      await collect();
+    } catch (e) {
+      say(herr(e), "danger"); sfx("bad");
+      await collect();
+    } finally {
+      D.busy = false; paint();
+    }
+  }
+
+  async function probePush() {
+    D.busy = true; D.lastFlow = Date.now(); paint(); sfx("send");
+    try {
+      var r = await rpc("hifz_push_probe");
+      if (r.error) throw r.error;
+      var d = r.data || {};
+      if (!d.dispatched) say(d.reason || "Канал отправки не готов", "danger");
+      else if (!d.subscriptions) say("Запрос ушёл, но подписок нет", "warn");
+      else say("Запрос отправлен в очередь. Ждём ответ функции…", "info");
+      setTimeout(async function () { await collect(); paint(); report(); }, 2600);
+    } catch (e) { say(herr(e), "danger"); sfx("bad"); }
+    finally { D.busy = false; paint(); }
+  }
+
+  async function probeChat() {
+    D.busy = true; D.lastFlow = Date.now(); paint(); sfx("send");
+    try {
+      var r = await rpc("hifz_push_probe_chat");
+      if (r.error) throw r.error;
+      say("Сообщение в общем чате создано — триггер должен отправить push", "info");
+      setTimeout(async function () { await collect(); paint(); report(); }, 3000);
+    } catch (e) { say(herr(e), "danger"); sfx("bad"); }
+    finally { D.busy = false; paint(); }
+  }
+
+  function report() {
+    var last = (D.server && D.server.http_logs || [])[0];
+    if (!last) return;
+    if (last.status === 200) { say("Функция ответила 200 — доставка прошла", "success"); sfx("good"); }
+    else { say("Функция ответила " + (last.status || "ошибкой") + " — смотри журнал ниже", "danger"); sfx("bad"); }
+  }
+
+  function reportText() {
+    var h = health();
+    var lines = ["ЖУРНАЛ ХИФЗА · ДИАГНОСТИКА PUSH", new Date().toLocaleString("ru-RU"), "Статус: " + h.label, ""];
+    D.stages.forEach(function (s) {
+      lines.push((s.state === "ok" ? "[OK]  " : s.state === "bad" ? "[FAIL]" : s.state === "warn" ? "[WARN]" : "[ — ] ") + " " + s.label + " — " + s.note);
+    });
+    lines.push("", "ПОСЛЕДНИЕ ВЫЗОВЫ:");
+    (D.server && D.server.http_logs || []).slice(0, 8).forEach(function (l) {
+      lines.push(hhmm(l.created) + " · " + (l.status || "err") + " · " + (l.error || "") + " " + String(l.body || "").slice(0, 120));
+    });
+    return lines.join("\n");
+  }
+
+  /* ---------- разметка ---------- */
+  function chainHTML() {
+    var list = D.onlyBad ? D.stages.filter(function (s) { return s.state !== "ok" && s.state !== "idle"; }) : D.stages;
+    if (!list.length) return '<div class="dg-allgood">Все звенья в порядке — цепочка доставки целая.</div>';
+    var flowing = Date.now() - D.lastFlow < 3200;
+    return '<div class="dg-chain ' + (flowing ? "flow" : "") + '">' + list.map(function (s, i) {
+      return '<button class="dg-node ' + s.state + '" data-dg="stage" data-id="' + s.id + '" style="--n:' + i + '">' +
+        '<span class="dg-dot"><i></i></span>' +
+        '<span class="dg-body"><b>' + E(s.label) + '</b><small>' + E(s.note) + '</small></span>' +
+        '<span class="dg-mark">' + (s.state === "ok" ? "✓" : s.state === "bad" ? "!" : s.state === "warn" ? "~" : "·") + '</span>' +
+      '</button>';
+    }).join("") + '</div>';
+  }
+
+  function logsHTML() {
+    var logs = (D.server && D.server.http_logs) || [];
+    if (!logs.length) return '<div class="dg-empty">Вызовов функции ещё не было. Нажми «Тест push», чтобы создать первый.</div>';
+    return '<div class="dg-logs">' + logs.map(function (l, i) {
+      var cls = l.error || l.timed_out ? "bad" : l.status === 200 ? "ok" : "warn";
+      var open = !!D.logsOpen[i];
+      return '<div class="dg-log ' + cls + '">' +
+        '<button class="dg-log-head" data-dg="log" data-i="' + i + '">' +
+          '<span class="dg-code">' + (l.status || "ERR") + '</span>' +
+          '<span class="dg-when">' + hhmm(l.created) + '</span>' +
+          '<span class="dg-ago">' + ago(l.created) + '</span>' +
+          '<span class="dg-caret">' + (open ? "▾" : "▸") + '</span>' +
+        '</button>' +
+        (open ? '<pre class="dg-log-body">' + E(l.error || l.body || "(пустой ответ)") + '</pre>' : "") +
+      '</div>';
+    }).join("") + '</div>';
+  }
+
+  function detailHTML() {
+    var s = D.stages.find(function (x) { return x.id === D.detail; });
+    if (!s) return "";
+    return '<div class="dg-detail ' + s.state + '">' +
+      '<div class="dg-detail-top"><b>' + E(s.label) + '</b>' +
+        '<button class="dg-x" data-dg="detail-close">✕</button></div>' +
+      '<p>' + E(s.hint) + '</p>' +
+      '<div class="dg-detail-now">Сейчас: ' + E(s.note) + '</div>' +
+      (s.fix ? '<button class="btn primary block" data-dg="fix" data-kind="' + s.fix + '"' + (D.busy ? " disabled" : "") + '>Исправить</button>' : "") +
+    '</div>';
+  }
+
+  function paint() {
+    var root = document.getElementById("dgRoot");
+    if (!root) return;
+    var h = health();
+    var c = D.client || {}, s = D.server || {};
+
+    root.innerHTML =
+      '<div class="dg-shell ' + h.key + '">' +
+        '<header class="dg-top">' +
+          '<div class="dg-title">' +
+            '<span class="dg-pulse"></span>' +
+            '<div><h3>Диагностика доставки</h3><small>' + E(h.label) + (h.n ? " · " + h.n : "") + '</small></div>' +
+          '</div>' +
+          '<div class="dg-top-actions">' +
+            '<button class="dg-icon ' + (D.sound ? "on" : "") + '" data-dg="sound" title="Звук">' + (D.sound ? "🔊" : "🔇") + '</button>' +
+            '<button class="dg-icon" data-dg="close" title="Закрыть">✕</button>' +
+          '</div>' +
+        '</header>' +
+
+        '<div class="dg-controls">' +
+          '<button class="dg-ctl primary" data-dg="refresh"' + (D.busy ? " disabled" : "") + '>↻ Обновить</button>' +
+          '<button class="dg-ctl accent" data-dg="probe"' + (D.busy ? " disabled" : "") + '>Тест push</button>' +
+          '<button class="dg-ctl accent2" data-dg="probe-chat"' + (D.busy ? " disabled" : "") + '>Сообщение в чат</button>' +
+          '<label class="dg-ctl toggle"><input type="checkbox" data-dg="auto" ' + (D.auto ? "checked" : "") + '><i></i><span>Авто</span></label>' +
+          '<div class="dg-ctl stepper"><span>Каждые</span>' +
+            '<button data-dg="step" data-d="-5">−</button><b>' + D.every + 'с</b><button data-dg="step" data-d="5">+</button>' +
+          '</div>' +
+          '<label class="dg-ctl toggle"><input type="checkbox" data-dg="onlybad" ' + (D.onlyBad ? "checked" : "") + '><i></i><span>Только проблемы</span></label>' +
+          '<button class="dg-ctl" data-dg="resub"' + (D.busy ? " disabled" : "") + '>Переподписать</button>' +
+          '<button class="dg-ctl" data-dg="copy">Копировать отчёт</button>' +
+          '<button class="dg-ctl" data-dg="export">Скачать JSON</button>' +
+        '</div>' +
+
+        (c.serverErr ? '<div class="dg-banner bad">Серверная диагностика недоступна: ' + E(c.serverErr) + '. Выполни SQL-патч диагностики.</div>' : "") +
+        (c.err ? '<div class="dg-banner warn">Браузер: ' + E(c.err) + '</div>' : "") +
+
+        '<section class="dg-section">' +
+          '<div class="dg-sec-head"><b>Цепочка доставки</b><span>' + D.stages.filter(function (x) { return x.state === "ok"; }).length + ' / ' + D.stages.length + ' в порядке</span></div>' +
+          chainHTML() +
+          detailHTML() +
+        '</section>' +
+
+        '<section class="dg-section">' +
+          '<div class="dg-sec-head"><b>Ответы функции рассылки</b><span>' + ((s.http_logs || []).length) + ' записей</span></div>' +
+          logsHTML() +
+        '</section>' +
+
+        '<section class="dg-section">' +
+          '<div class="dg-sec-head"><b>Состояние сервера</b></div>' +
+          '<div class="dg-facts">' +
+            fact("Ключ в базе", s.config_key_set ? s.config_key_len + " симв." : "нет", s.config_key_set ? "ok" : "bad") +
+            fact("Секрет", s.secret_set ? s.secret_len + " симв." : "нет", s.secret_set ? "ok" : "bad") +
+            fact("Триггеры", String(s.triggers || 0), (s.triggers || 0) >= 3 ? "ok" : "bad") +
+            fact("Cron", s.cron ? "активен" : "нет", s.cron ? "ok" : "warn") +
+            fact("Устройств", String((s.subs || []).length), (s.subs || []).length ? "ok" : "bad") +
+            fact("Диалогов", String(s.memberships || 0), (s.memberships || 0) ? "ok" : "warn") +
+            fact("Сообщений", String(s.messages || 0), "idle") +
+            fact("Подписка", c.sub ? "есть" : "нет", c.sub ? "ok" : "bad") +
+          '</div>' +
+        '</section>' +
+      '</div>';
+  }
+
+  function fact(label, value, state) {
+    return '<div class="dg-fact ' + state + '"><b>' + E(value) + '</b><span>' + E(label) + '</span></div>';
+  }
+
+  function openPanel() {
+    D.open = true;
+    var host = document.getElementById("dgHost");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "dgHost";
+      host.className = "dg-host";
+      host.innerHTML = '<div class="dg-scrim" data-dg="close"></div><div id="dgRoot" class="dg-panel"></div>';
+      document.body.appendChild(host);
+    }
+    host.classList.add("on");
+    document.body.style.overflow = "hidden";
+    paint();
+    collect().then(function () { paint(); sfx("tick"); });
+    restartTimer();
+  }
+
+  function closePanel() {
+    D.open = false;
+    var host = document.getElementById("dgHost");
+    if (host) host.classList.remove("on");
+    document.body.style.overflow = "";
+    if (D.timer) { clearInterval(D.timer); D.timer = null; }
+  }
+
+  function restartTimer() {
+    if (D.timer) clearInterval(D.timer);
+    if (!D.auto || !D.open) return;
+    D.timer = setInterval(function () {
+      if (!D.busy) collect().then(paint);
+    }, D.every * 1000);
+  }
+
+  /* ---------- стили ---------- */
+  if (!document.getElementById("dg-css")) {
+    var st = document.createElement("style");
+    st.id = "dg-css";
+    st.textContent = [
+      ".dg-host{position:fixed;inset:0;z-index:880;display:none}",
+      ".dg-host.on{display:block}",
+      ".dg-scrim{position:absolute;inset:0;background:radial-gradient(120% 80% at 70% 0%,rgba(13,148,180,.18),transparent 60%),rgba(8,14,22,.6);backdrop-filter:blur(7px);animation:dgFade .2s both}",
+      "@keyframes dgFade{from{opacity:0}to{opacity:1}}",
+      ".dg-panel{position:absolute;right:0;top:0;bottom:0;width:min(620px,100%);overflow-y:auto;",
+      "  background:var(--surface,#fff);border-left:1px solid var(--line,#dbe8f4);",
+      "  box-shadow:-24px 0 70px rgba(8,14,22,.4);animation:dgSlide .28s cubic-bezier(.2,.8,.3,1) both}",
+      "@keyframes dgSlide{from{transform:translateX(100%)}to{transform:none}}",
+      ".dg-panel{scrollbar-width:thin;scrollbar-color:var(--dg-a) var(--surface3,#ecf4fb)}",
+      ".dg-panel::-webkit-scrollbar{width:11px}",
+      ".dg-panel::-webkit-scrollbar-track{background:var(--surface3,#ecf4fb)}",
+      ".dg-panel::-webkit-scrollbar-thumb{background:linear-gradient(180deg,var(--dg-a),var(--dg-b));border-radius:9px;border:3px solid var(--surface3,#ecf4fb)}",
+      ".dg-panel::-webkit-scrollbar-thumb:hover{background:var(--dg-b)}",
+      ".dg-shell{--dg-a:#1a6fd6;--dg-b:#0d94b4;--dg-ok:#1e8e52;--dg-warn:#b97708;--dg-bad:#cf3d3d;--dg-vio:#6a5ae0;--dg-idle:#92a8c0;padding-bottom:26px}",
+      "[data-theme='dark'] .dg-shell{--dg-a:#4d9fff;--dg-b:#3ec6dd;--dg-ok:#4cc38a;--dg-warn:#e0a232;--dg-bad:#f06a6a;--dg-vio:#9a8cff;--dg-idle:#647a94}",
+      ".dg-shell.ok{--dg-a:#1e8e52;--dg-b:#0d94b4}",
+      ".dg-shell.bad{--dg-a:#cf3d3d;--dg-b:#6a5ae0}",
+      ".dg-shell.warn{--dg-a:#b97708;--dg-b:#1a6fd6}",
+      ".dg-top{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:14px;padding:16px 20px;",
+      "  background:linear-gradient(120deg,color-mix(in srgb,var(--dg-a) 14%,var(--surface)),var(--surface));",
+      "  border-bottom:1px solid var(--line)}",
+      ".dg-title{display:flex;align-items:center;gap:12px;flex:1;min-width:0}",
+      ".dg-title h3{font-size:16.5px;font-weight:800;letter-spacing:-.2px;line-height:1.2}",
+      ".dg-title small{display:block;font-size:11.5px;font-weight:700;color:var(--dg-a);margin-top:2px}",
+      ".dg-pulse{width:12px;height:12px;border-radius:50%;background:var(--dg-a);flex:none;position:relative}",
+      ".dg-pulse::after{content:'';position:absolute;inset:-5px;border-radius:50%;border:2px solid var(--dg-a);opacity:.5;animation:dgRing 1.9s ease-out infinite}",
+      "@keyframes dgRing{0%{transform:scale(.7);opacity:.6}70%{transform:scale(1.5);opacity:0}100%{opacity:0}}",
+      ".dg-top-actions{display:flex;gap:7px}",
+      ".dg-icon{width:34px;height:34px;border-radius:10px;border:1px solid var(--line2);background:var(--surface);",
+      "  color:var(--muted);cursor:pointer;font-size:13px;display:grid;place-items:center;transition:.15s}",
+      ".dg-icon:hover{border-color:var(--dg-a);color:var(--dg-a);transform:translateY(-1px)}",
+      ".dg-icon.on{color:var(--dg-ok);border-color:color-mix(in srgb,var(--dg-ok) 40%,var(--line))}",
+      ".dg-controls{display:flex;flex-wrap:wrap;gap:7px;padding:14px 20px;background:var(--surface2);border-bottom:1px solid var(--line);position:sticky;top:66px;z-index:2}",
+      ".dg-ctl{border:1px solid var(--line2);background:var(--surface);color:var(--ink);cursor:pointer;",
+      "  font:inherit;font-weight:700;font-size:12px;padding:7px 12px;border-radius:10px;min-height:34px;",
+      "  display:inline-flex;align-items:center;gap:7px;transition:.15s}",
+      ".dg-ctl:hover:not(:disabled){border-color:var(--dg-a);color:var(--dg-a);transform:translateY(-1px)}",
+      ".dg-ctl:disabled{opacity:.45;cursor:not-allowed}",
+      ".dg-ctl.primary{background:linear-gradient(135deg,var(--dg-a),var(--dg-b));color:#fff;border-color:transparent;box-shadow:0 4px 14px color-mix(in srgb,var(--dg-a) 32%,transparent)}",
+      ".dg-ctl.primary:hover{color:#fff;filter:brightness(1.08)}",
+      ".dg-ctl.accent{background:color-mix(in srgb,var(--dg-vio) 14%,var(--surface));color:var(--dg-vio);border-color:color-mix(in srgb,var(--dg-vio) 32%,var(--line))}",
+      ".dg-ctl.accent2{background:color-mix(in srgb,var(--dg-b) 14%,var(--surface));color:var(--dg-b);border-color:color-mix(in srgb,var(--dg-b) 32%,var(--line))}",
+      ".dg-ctl.toggle{cursor:pointer;user-select:none}",
+      ".dg-ctl.toggle input{position:absolute;opacity:0;width:1px;height:1px;min-height:0}",
+      ".dg-ctl.toggle i{width:32px;height:18px;border-radius:9px;background:var(--line2);position:relative;transition:.2s;flex:none}",
+      ".dg-ctl.toggle i::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:.2s}",
+      ".dg-ctl.toggle input:checked+i{background:linear-gradient(135deg,var(--dg-a),var(--dg-b))}",
+      ".dg-ctl.toggle input:checked+i::after{transform:translateX(14px)}",
+      ".dg-ctl.stepper{gap:6px;padding:5px 9px}",
+      ".dg-ctl.stepper span{font-size:11px;color:var(--muted)}",
+      ".dg-ctl.stepper b{font-size:12px;min-width:30px;text-align:center;color:var(--dg-a)}",
+      ".dg-ctl.stepper button{width:22px;height:22px;border-radius:7px;border:1px solid var(--line2);background:var(--surface2);cursor:pointer;font-weight:800;color:var(--ink);line-height:1}",
+      ".dg-ctl.stepper button:hover{border-color:var(--dg-a);color:var(--dg-a)}",
+      ".dg-banner{margin:14px 20px 0;padding:11px 14px;border-radius:12px;font-size:12.5px;font-weight:700;line-height:1.5}",
+      ".dg-banner.bad{background:color-mix(in srgb,var(--dg-bad) 13%,var(--surface));color:var(--dg-bad);border:1px solid color-mix(in srgb,var(--dg-bad) 30%,var(--line))}",
+      ".dg-banner.warn{background:color-mix(in srgb,var(--dg-warn) 13%,var(--surface));color:var(--dg-warn);border:1px solid color-mix(in srgb,var(--dg-warn) 30%,var(--line))}",
+      ".dg-section{padding:18px 20px 0}",
+      ".dg-sec-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:12px}",
+      ".dg-sec-head b{font-size:11.5px;font-weight:800;letter-spacing:.8px;text-transform:uppercase;color:var(--muted)}",
+      ".dg-sec-head span{font-size:11.5px;font-weight:800;color:var(--dg-a)}",
+      ".dg-chain{display:flex;flex-direction:column;gap:0;position:relative}",
+      ".dg-node{display:flex;align-items:center;gap:12px;width:100%;border:0;background:transparent;cursor:pointer;",
+      "  padding:9px 10px;border-radius:12px;text-align:left;font:inherit;transition:.16s;position:relative;",
+      "  animation:dgIn .32s ease-out both;animation-delay:calc(var(--n)*35ms)}",
+      "@keyframes dgIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}",
+      ".dg-node:hover{background:var(--surface2)}",
+      ".dg-node::before{content:'';position:absolute;left:20px;top:-2px;bottom:-2px;width:2px;background:var(--line2);z-index:0}",
+      ".dg-node:first-child::before{top:50%}",
+      ".dg-node:last-child::before{bottom:50%}",
+      ".dg-node.ok::before{background:linear-gradient(180deg,var(--dg-ok),color-mix(in srgb,var(--dg-ok) 45%,var(--line2)))}",
+      ".dg-node.bad::before{background:repeating-linear-gradient(180deg,var(--dg-bad) 0 4px,transparent 4px 9px)}",
+      ".dg-chain.flow .dg-node.ok::before{background:linear-gradient(180deg,transparent,var(--dg-b),transparent);background-size:100% 200%;animation:dgFlow 1.1s linear infinite}",
+      "@keyframes dgFlow{from{background-position:0 -100%}to{background-position:0 100%}}",
+      ".dg-dot{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;flex:none;z-index:1;",
+      "  background:var(--surface);border:2px solid var(--dg-idle)}",
+      ".dg-dot i{width:8px;height:8px;border-radius:50%;background:var(--dg-idle)}",
+      ".dg-node.ok .dg-dot{border-color:var(--dg-ok)} .dg-node.ok .dg-dot i{background:var(--dg-ok)}",
+      ".dg-node.warn .dg-dot{border-color:var(--dg-warn)} .dg-node.warn .dg-dot i{background:var(--dg-warn)}",
+      ".dg-node.bad .dg-dot{border-color:var(--dg-bad);box-shadow:0 0 0 4px color-mix(in srgb,var(--dg-bad) 16%,transparent)}",
+      ".dg-node.bad .dg-dot i{background:var(--dg-bad);animation:dgBlink 1.3s ease-in-out infinite}",
+      "@keyframes dgBlink{50%{opacity:.3}}",
+      ".dg-body{flex:1;min-width:0}",
+      ".dg-body b{display:block;font-size:13px;font-weight:800;color:var(--ink)}",
+      ".dg-body small{display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".dg-node.bad .dg-body small{color:var(--dg-bad)}",
+      ".dg-node.warn .dg-body small{color:var(--dg-warn)}",
+      ".dg-mark{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;font-size:11px;font-weight:800;flex:none;",
+      "  background:var(--surface3);color:var(--muted)}",
+      ".dg-node.ok .dg-mark{background:color-mix(in srgb,var(--dg-ok) 16%,var(--surface));color:var(--dg-ok)}",
+      ".dg-node.warn .dg-mark{background:color-mix(in srgb,var(--dg-warn) 16%,var(--surface));color:var(--dg-warn)}",
+      ".dg-node.bad .dg-mark{background:color-mix(in srgb,var(--dg-bad) 16%,var(--surface));color:var(--dg-bad)}",
+      ".dg-allgood{padding:20px;border-radius:14px;text-align:center;font-size:13px;font-weight:700;color:var(--dg-ok);",
+      "  background:color-mix(in srgb,var(--dg-ok) 10%,var(--surface));border:1px solid color-mix(in srgb,var(--dg-ok) 28%,var(--line))}",
+      ".dg-detail{margin-top:12px;padding:14px;border-radius:14px;background:var(--surface2);border:1px solid var(--line2);animation:dgIn .2s both}",
+      ".dg-detail.bad{border-color:color-mix(in srgb,var(--dg-bad) 35%,var(--line))}",
+      ".dg-detail-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}",
+      ".dg-detail-top b{font-size:13.5px;font-weight:800}",
+      ".dg-x{border:0;background:var(--surface3);color:var(--muted);width:26px;height:26px;border-radius:8px;cursor:pointer}",
+      ".dg-detail p{font-size:12.5px;font-weight:500;line-height:1.6;color:var(--muted);margin-bottom:9px}",
+      ".dg-detail-now{font-size:12px;font-weight:800;color:var(--dg-a);margin-bottom:11px}",
+      ".dg-logs{display:flex;flex-direction:column;gap:6px;max-height:290px;overflow-y:auto;padding-right:3px}",
+      ".dg-logs{scrollbar-width:thin;scrollbar-color:var(--dg-a) var(--surface3)}",
+      ".dg-logs::-webkit-scrollbar{width:8px}",
+      ".dg-logs::-webkit-scrollbar-track{background:var(--surface3);border-radius:6px}",
+      ".dg-logs::-webkit-scrollbar-thumb{background:var(--dg-a);border-radius:6px;border:2px solid var(--surface3)}",
+      ".dg-log{border:1px solid var(--line);border-radius:11px;overflow:hidden;background:var(--surface2)}",
+      ".dg-log.ok{border-color:color-mix(in srgb,var(--dg-ok) 28%,var(--line))}",
+      ".dg-log.bad{border-color:color-mix(in srgb,var(--dg-bad) 32%,var(--line))}",
+      ".dg-log-head{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;cursor:pointer;padding:9px 11px;font:inherit;text-align:left}",
+      ".dg-code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;font-weight:800;padding:2px 8px;border-radius:7px;background:var(--surface3);color:var(--muted)}",
+      ".dg-log.ok .dg-code{background:color-mix(in srgb,var(--dg-ok) 16%,var(--surface));color:var(--dg-ok)}",
+      ".dg-log.bad .dg-code{background:color-mix(in srgb,var(--dg-bad) 16%,var(--surface));color:var(--dg-bad)}",
+      ".dg-log.warn .dg-code{background:color-mix(in srgb,var(--dg-warn) 16%,var(--surface));color:var(--dg-warn)}",
+      ".dg-when{font-size:12px;font-weight:800}",
+      ".dg-ago{font-size:11px;font-weight:600;color:var(--muted);margin-left:auto}",
+      ".dg-caret{font-size:11px;color:var(--faint)}",
+      ".dg-log-body{margin:0;padding:10px 12px;border-top:1px solid var(--line);background:var(--surface);",
+      "  font-family:ui-monospace,Menlo,monospace;font-size:10.5px;line-height:1.6;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:170px;overflow:auto}",
+      ".dg-empty{padding:18px;border-radius:12px;background:var(--surface2);border:1px dashed var(--line2);text-align:center;font-size:12.5px;font-weight:600;color:var(--muted)}",
+      ".dg-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:8px}",
+      ".dg-fact{padding:10px 12px;border-radius:12px;background:var(--surface2);border:1px solid var(--line)}",
+      ".dg-fact b{display:block;font-size:16px;font-weight:800;line-height:1.15;color:var(--muted)}",
+      ".dg-fact span{display:block;font-size:10.5px;font-weight:700;color:var(--faint);margin-top:3px}",
+      ".dg-fact.ok b{color:var(--dg-ok)} .dg-fact.bad b{color:var(--dg-bad)} .dg-fact.warn b{color:var(--dg-warn)}",
+      ".dg-entry{display:flex;align-items:center;gap:8px;width:100%;margin-top:12px;border:1px dashed var(--line2);",
+      "  background:var(--surface2);color:var(--muted);cursor:pointer;font:inherit;font-weight:800;font-size:12px;",
+      "  padding:10px 13px;border-radius:12px;transition:.16s}",
+      ".dg-entry:hover{border-color:#6a5ae0;color:#6a5ae0;background:color-mix(in srgb,#6a5ae0 8%,var(--surface))}",
+      "@media(max-width:640px){.dg-controls{position:static}.dg-top{position:static}.dg-panel{width:100%}.dg-ctl{flex:1;justify-content:center}}",
+      "@media(prefers-reduced-motion:reduce){.dg-shell *{animation:none!important}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- события ---------- */
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-dg]");
+    if (!t) return;
+    var a = t.dataset.dg;
+    e.preventDefault(); e.stopPropagation();
+
+    if (a === "open") { openPanel(); return; }
+    if (a === "close") { closePanel(); return; }
+    if (a === "sound") { D.sound = !D.sound; if (D.sound) sfx("tick"); paint(); return; }
+    if (a === "refresh") { D.busy = true; paint(); await collect(); D.busy = false; paint(); sfx("tick"); return; }
+    if (a === "probe") { await probePush(); return; }
+    if (a === "probe-chat") { await probeChat(); return; }
+    if (a === "resub") { await runFix("resub"); return; }
+    if (a === "fix") { await runFix(t.dataset.kind); return; }
+    if (a === "stage") { D.detail = D.detail === t.dataset.id ? null : t.dataset.id; paint(); sfx("tick"); return; }
+    if (a === "detail-close") { D.detail = null; paint(); return; }
+    if (a === "log") { var i = t.dataset.i; D.logsOpen[i] = !D.logsOpen[i]; paint(); return; }
+    if (a === "step") {
+      D.every = Math.min(120, Math.max(5, D.every + Number(t.dataset.d || 0)));
+      restartTimer(); paint(); sfx("tick"); return;
+    }
+    if (a === "copy") {
+      try { await navigator.clipboard.writeText(reportText()); say("Отчёт скопирован"); sfx("good"); }
+      catch (x) { say("Не удалось скопировать", "danger"); }
+      return;
+    }
+    if (a === "export") {
+      try {
+        var blob = new Blob([JSON.stringify({ at: new Date().toISOString(), client: D.client, server: D.server, stages: D.stages }, null, 2)], { type: "application/json" });
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement("a");
+        link.href = url; link.download = "hifz-push-diag.json";
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+        say("Отчёт скачан"); sfx("good");
+      } catch (x) { say("Не удалось скачать", "danger"); }
+      return;
+    }
+  }, true);
+
+  document.addEventListener("change", function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.dg) return;
+    if (el.dataset.dg === "auto") { D.auto = el.checked; restartTimer(); paint(); sfx("tick"); }
+    if (el.dataset.dg === "onlybad") { D.onlyBad = el.checked; paint(); sfx("tick"); }
+  }, true);
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && D.open) { closePanel(); }
+  }, true);
+
+  /* ---------- точки входа ---------- */
+  function injectEntry() {
+    var menu = document.getElementById("dataMenu");
+    if (menu && !menu.querySelector('[data-dg="open"]')) {
+      var b = document.createElement("button");
+      b.className = "menu-item";
+      b.dataset.dg = "open";
+      b.innerHTML = "🩺 Диагностика уведомлений";
+      menu.appendChild(b);
+    }
+    var hp = document.getElementById("hpBody");
+    if (hp && !hp.querySelector('[data-dg="open"]')) {
+      var e2 = document.createElement("button");
+      e2.className = "dg-entry";
+      e2.dataset.dg = "open";
+      e2.innerHTML = "🩺 Не приходят уведомления? Открыть диагностику цепочки";
+      hp.appendChild(e2);
+    }
+  }
+
+  if (typeof window.renderHeader === "function") {
+    var _rh = window.renderHeader;
+    window.renderHeader = function () {
+      var r = _rh.apply(this, arguments);
+      setTimeout(injectEntry, 0);
+      return r;
+    };
+  }
+
+  var mo = new MutationObserver(function () { injectEntry(); });
+  mo.observe(document.body, { childList: true, subtree: true });
+
+  window.HifzPushDiag = {
+    open: openPanel,
+    close: closePanel,
+    refresh: function () { return collect().then(paint); },
+    state: D
+  };
+
+  setTimeout(injectEntry, 1200);
+})();
+</script>
 </body>
    </html>
