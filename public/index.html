@@ -8273,5 +8273,334 @@ initCloud();
   setTimeout(sync, 1200);
 })();
 </script>
+<script>
+/* ==========================================================
+   DISPATCH OPERATOR · вставить перед </body>
+   Сообщение сохраняется своим путём, уведомление уходит отдельным
+   вызовом сразу после вставки. Дедупликация на сервере.
+   Без MutationObserver: обёртки renderChat / go + идемпотентный рендер.
+   ========================================================== */
+(function () {
+  if (window.__hifzOperator) return;
+  window.__hifzOperator = true;
+
+  var O = {
+    rows: [], open: false, auto: true, sound: true,
+    busy: false, last: "", chan: null, seen: {}, cid: null, timer: null
+  };
+  var AC = null;
+
+  function tone(f, d, g, sl) {
+    if (!O.sound) return;
+    try {
+      if (typeof prefs !== "undefined" && prefs.sound === false) return;
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === "suspended") AC.resume();
+      var t = AC.currentTime, o = AC.createOscillator(), v = AC.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f, t);
+      if (sl) o.frequency.exponentialRampToValueAtTime(sl, t + d);
+      v.gain.setValueAtTime(.0001, t);
+      v.gain.exponentialRampToValueAtTime(g, t + .012);
+      v.gain.exponentialRampToValueAtTime(.0001, t + d);
+      o.connect(v).connect(AC.destination); o.start(t); o.stop(t + d + .04);
+    } catch (e) {}
+  }
+  function sfx(k) {
+    if (k === "send") { tone(620, .07, .04, 880); }
+    if (k === "done") { tone(784, .09, .04); setTimeout(function () { tone(1046, .14, .035); }, 75); }
+    if (k === "dup")  { tone(400, .07, .028); }
+    if (k === "fail") { tone(220, .17, .05, 160); }
+    if (k === "tap")  { tone(560, .04, .024); }
+  }
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+  function herr(e) { try { return humanError(e); } catch (x) { return String((e && e.message) || e); } }
+  function hhmm(ts) { try { return fmtTime.format(new Date(ts)); } catch (e) { return String(ts || "").slice(11, 16); } }
+  function ago(ts) {
+    if (!ts) return "—";
+    var s = Math.max(0, Math.round((Date.now() - new Date(ts).getTime()) / 1000));
+    if (s < 60) return s + "с";
+    if (s < 3600) return Math.floor(s / 60) + "м";
+    return Math.floor(s / 3600) + "ч";
+  }
+
+  /* ---------- отправка ---------- */
+  async function dispatch(id, quiet) {
+    if (!id || O.seen[id]) return;
+    O.seen[id] = 1;
+    if (!quiet) sfx("send");
+    try {
+      var r = await rpc("hifz_push_chat", { p_message: id });
+      if (r.error) throw r.error;
+      var d = r.data || {};
+      if (d.dispatched) { if (!quiet) sfx("done"); }
+      else if (d.reason === "already_sent") { sfx("dup"); }
+      else if (!quiet) { say("Рассылка не ушла: " + (d.reason || "неизвестно"), "danger"); sfx("fail"); }
+    } catch (e) {
+      delete O.seen[id];
+      if (!quiet) { say(herr(e), "danger"); sfx("fail"); }
+    }
+    await loadLog();
+    paint();
+  }
+
+  async function loadLog() {
+    if (!staff()) return;
+    try {
+      var r = await rpc("hifz_push_log", { p_limit: 14 });
+      if (!r.error) O.rows = r.data || [];
+    } catch (e) {}
+  }
+
+  /* ---------- слушатель своих сообщений ---------- */
+  function attach() {
+    var m = mem();
+    if (!m || !staff() || typeof client === "undefined" || !client) return;
+    if (O.chan) return;
+    try {
+      O.chan = client.channel("hifz-dispatch-operator")
+        .on("postgres_changes", {
+          event: "INSERT", schema: "public", table: "hifz_chat_messages",
+          filter: "user_id=eq." + m.user_id
+        }, function (p) {
+          if (O.auto && p.new && p.new.id) dispatch(p.new.id, false);
+        })
+        .subscribe();
+    } catch (e) {}
+  }
+
+  function detach() {
+    if (O.chan) { try { client.removeChannel(O.chan); } catch (e) {} O.chan = null; }
+  }
+
+  /* запасной путь: после отправки формы добираем своё последнее сообщение */
+  document.addEventListener("submit", function (e) {
+    if (e.target.id !== "cvForm") return;
+    setTimeout(async function () {
+      var m = mem(); if (!m || !O.auto) return;
+      var cid = activeCid(); if (!cid) return;
+      try {
+        var r = await client.from("hifz_chat_messages")
+          .select("id").eq("conversation_id", cid).eq("user_id", m.user_id)
+          .order("created_at", { ascending: false }).limit(1).maybeSingle();
+        if (r.data && r.data.id) dispatch(r.data.id, true);
+      } catch (x) {}
+    }, 1400);
+  }, false);
+
+  function activeCid() {
+    var el = document.querySelector(".cv-item.active");
+    return el ? el.dataset.id : null;
+  }
+
+  /* ---------- отрисовка ---------- */
+  function stateOf(r) {
+    if (r.sent_at) return r.via === "sweep" ? "sweep" : "sent";
+    return "queued";
+  }
+
+  function paint() {
+    var form = document.getElementById("cvForm");
+    if (!form || !staff()) return;
+    var box = document.getElementById("opBox");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "opBox";
+      form.parentNode.insertBefore(box, form);
+    }
+
+    var last = O.rows[0];
+    var pending = O.rows.filter(function (r) { return !r.sent_at; }).length;
+    var st = last ? stateOf(last) : "idle";
+    var label = !last ? "Оператор готов"
+      : st === "queued" ? "В очереди · " + ago(last.created_at)
+      : st === "sweep" ? "Добрано страховкой · " + ago(last.sent_at)
+      : "Отправлено · " + ago(last.sent_at);
+
+    var html =
+      '<div class="op-bar ' + st + (pending ? " has-pending" : "") + '">' +
+        '<span class="op-led"></span>' +
+        '<span class="op-main"><b>Оператор рассылки</b><small>' + E(label) + '</small></span>' +
+        (pending ? '<span class="op-badge">' + pending + '</span>' : "") +
+        '<button class="op-btn" data-op="toggle">' + (O.open ? "▾" : "▸") + '</button>' +
+      '</div>' +
+      (O.open ?
+        '<div class="op-body">' +
+          '<div class="op-tools">' +
+            '<label class="op-tg"><input type="checkbox" data-op="auto" ' + (O.auto ? "checked" : "") + '><i></i><span>Авто</span></label>' +
+            '<button class="op-tool" data-op="refresh">↻ Обновить</button>' +
+            '<button class="op-tool" data-op="sweep">Добрать очередь</button>' +
+            '<button class="op-tool" data-op="sound">' + (O.sound ? "🔊 Звук" : "🔇 Тихо") + '</button>' +
+            '<button class="op-tool" data-op="copy">Копировать журнал</button>' +
+          '</div>' +
+          '<div class="op-list">' +
+            (O.rows.length ? O.rows.map(function (r) {
+              var s = stateOf(r);
+              var total = r.reachable + (r.solo ? 1 : 0);
+              return '<div class="op-row ' + s + '">' +
+                '<span class="op-mark">' + (s === "sent" ? "✓" : s === "sweep" ? "↻" : "…") + '</span>' +
+                '<span class="op-txt"><b>' + E(r.author_name) + (r.mine ? ' <em>вы</em>' : "") + '</b>' +
+                  '<small>' + E(r.preview) + '</small></span>' +
+                '<span class="op-meta">' +
+                  '<i class="op-reach ' + (total ? "on" : "off") + '">' + total + '/' + r.others + '</i>' +
+                  '<i class="op-time">' + hhmm(r.created_at) + '</i>' +
+                '</span>' +
+                (!r.sent_at && r.mine ? '<button class="op-fire" data-op="fire" data-id="' + r.id + '">Отправить</button>' : "") +
+              '</div>';
+            }).join("") : '<div class="op-empty">Сообщений пока нет.</div>') +
+          '</div>' +
+          '<div class="op-note">Сообщение сохраняется независимо от рассылки. Если вкладка закроется до отправки — очередь доберётся страховкой в течение минуты.</div>' +
+        '</div>' : "");
+
+    if (html === O.last) return;
+    O.last = html;
+    box.innerHTML = html;
+  }
+
+  function sync() {
+    if (!staff()) return;
+    attach();
+    var cid = activeCid();
+    if (cid !== O.cid) { O.cid = cid; O.last = ""; }
+    loadLog().then(paint);
+  }
+
+  /* ---------- стили ---------- */
+  if (!document.getElementById("op-css")) {
+    var st = document.createElement("style");
+    st.id = "op-css";
+    st.textContent = [
+      "#opBox{padding:0 12px}",
+      ".op-bar{--o:#6a5ae0;display:flex;align-items:center;gap:10px;padding:9px 12px;",
+      "  border:1px solid color-mix(in srgb,var(--o) 26%,var(--line));border-bottom:0;",
+      "  border-radius:12px 12px 0 0;background:color-mix(in srgb,var(--o) 8%,var(--surface2))}",
+      ".op-bar.sent{--o:#1e8e52}.op-bar.sweep{--o:#0d94b4}.op-bar.queued{--o:#b97708}.op-bar.idle{--o:#6a5ae0}",
+      "[data-theme='dark'] .op-bar.sent{--o:#4cc38a}",
+      "[data-theme='dark'] .op-bar.sweep{--o:#3ec6dd}",
+      "[data-theme='dark'] .op-bar.queued{--o:#e0a232}",
+      "[data-theme='dark'] .op-bar{--o:#9a8cff}",
+      ".op-led{width:8px;height:8px;border-radius:50%;background:var(--o);flex:none;",
+      "  box-shadow:0 0 0 3px color-mix(in srgb,var(--o) 20%,transparent)}",
+      ".op-bar.queued .op-led{animation:opPulse 1.2s ease-in-out infinite}",
+      "@keyframes opPulse{50%{opacity:.3;transform:scale(.8)}}",
+      ".op-main{flex:1;min-width:0}",
+      ".op-main b{display:block;font-size:11.5px;font-weight:800;color:var(--o)}",
+      ".op-main small{display:block;font-size:10.5px;font-weight:600;color:var(--muted);margin-top:1px}",
+      ".op-badge{font-size:10px;font-weight:800;padding:2px 7px;border-radius:8px;flex:none;",
+      "  background:var(--o);color:#fff}",
+      ".op-btn{border:0;background:transparent;cursor:pointer;color:var(--o);font:inherit;font-weight:800;",
+      "  padding:3px 7px;border-radius:7px;flex:none}",
+      ".op-btn:hover{background:color-mix(in srgb,var(--o) 14%,transparent)}",
+      ".op-body{border:1px solid color-mix(in srgb,#6a5ae0 22%,var(--line));border-bottom:0;background:var(--surface2)}",
+      ".op-tools{display:flex;flex-wrap:wrap;gap:6px;padding:9px 11px;border-bottom:1px solid var(--line)}",
+      ".op-tool{border:1px solid var(--line2);background:var(--surface);cursor:pointer;font:inherit;",
+      "  font-weight:700;font-size:11px;padding:5px 10px;border-radius:9px;color:var(--ink);transition:.15s}",
+      ".op-tool:hover{border-color:#6a5ae0;color:#6a5ae0}",
+      ".op-tg{display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:11px;font-weight:800;",
+      "  border:1px solid var(--line2);background:var(--surface);padding:5px 10px;border-radius:9px}",
+      ".op-tg input{position:absolute;opacity:0;width:1px;height:1px;min-height:0}",
+      ".op-tg i{width:28px;height:16px;border-radius:8px;background:var(--line2);position:relative;transition:.2s;flex:none}",
+      ".op-tg i::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:.2s}",
+      ".op-tg input:checked+i{background:linear-gradient(135deg,#6a5ae0,#0d94b4)}",
+      ".op-tg input:checked+i::after{transform:translateX(12px)}",
+      ".op-list{max-height:236px;overflow-y:auto;padding:7px 9px;display:flex;flex-direction:column;gap:5px}",
+      ".op-list{scrollbar-width:thin;scrollbar-color:#6a5ae0 var(--surface3)}",
+      ".op-list::-webkit-scrollbar{width:9px}",
+      ".op-list::-webkit-scrollbar-track{background:var(--surface3);border-radius:7px}",
+      ".op-list::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#6a5ae0,#0d94b4);border-radius:7px;border:2px solid var(--surface3)}",
+      ".op-row{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:10px;",
+      "  background:var(--surface);border:1px solid var(--line)}",
+      ".op-row.queued{border-color:color-mix(in srgb,#b97708 34%,var(--line))}",
+      ".op-mark{width:20px;height:20px;border-radius:7px;display:grid;place-items:center;flex:none;",
+      "  font-size:10px;font-weight:800;background:var(--surface3);color:var(--muted)}",
+      ".op-row.sent .op-mark{background:color-mix(in srgb,#1e8e52 16%,var(--surface));color:#1e8e52}",
+      ".op-row.sweep .op-mark{background:color-mix(in srgb,#0d94b4 16%,var(--surface));color:#0d94b4}",
+      ".op-row.queued .op-mark{background:color-mix(in srgb,#b97708 16%,var(--surface));color:#b97708}",
+      ".op-txt{flex:1;min-width:0}",
+      ".op-txt b{display:block;font-size:11.5px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".op-txt em{font-style:normal;font-size:9px;font-weight:800;color:#6a5ae0;background:color-mix(in srgb,#6a5ae0 14%,var(--surface));padding:1px 5px;border-radius:5px;margin-left:4px}",
+      ".op-txt small{display:block;font-size:10.5px;font-weight:600;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}",
+      ".op-meta{display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex:none}",
+      ".op-reach{font-style:normal;font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:6px}",
+      ".op-reach.on{background:color-mix(in srgb,#1e8e52 15%,var(--surface));color:#1e8e52}",
+      ".op-reach.off{background:color-mix(in srgb,#cf3d3d 15%,var(--surface));color:#cf3d3d}",
+      ".op-time{font-style:normal;font-size:9.5px;font-weight:700;color:var(--faint)}",
+      ".op-fire{border:0;cursor:pointer;font:inherit;font-weight:800;font-size:10.5px;padding:5px 9px;",
+      "  border-radius:8px;background:linear-gradient(135deg,#6a5ae0,#0d94b4);color:#fff;flex:none}",
+      ".op-fire:hover{filter:brightness(1.1)}",
+      ".op-empty{padding:16px;text-align:center;font-size:11.5px;font-weight:600;color:var(--muted)}",
+      ".op-note{padding:9px 12px;font-size:10.5px;font-weight:600;line-height:1.5;color:var(--muted);border-top:1px solid var(--line)}",
+      "@media(max-width:560px){.op-meta{display:none}.op-tool{flex:1;text-align:center}}",
+      "@media(prefers-reduced-motion:reduce){.op-bar *{animation:none!important}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- события ---------- */
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-op]");
+    if (!t) return;
+    var a = t.dataset.op;
+    if (a === "auto") return;
+    e.preventDefault(); e.stopPropagation();
+
+    if (a === "toggle") { O.open = !O.open; O.last = ""; sfx("tap"); if (O.open) await loadLog(); paint(); return; }
+    if (a === "refresh") { O.last = ""; await loadLog(); paint(); sfx("tap"); return; }
+    if (a === "sound") { O.sound = !O.sound; if (O.sound) sfx("tap"); O.last = ""; paint(); return; }
+    if (a === "fire") { await dispatch(t.dataset.id, false); return; }
+    if (a === "sweep") {
+      var n = 0;
+      for (var i = 0; i < O.rows.length; i++) {
+        var r = O.rows[i];
+        if (!r.sent_at && r.mine) { await dispatch(r.id, true); n++; }
+      }
+      say(n ? "Отправлено из очереди: " + n : "Очередь пуста", n ? "success" : "info");
+      O.last = ""; await loadLog(); paint(); return;
+    }
+    if (a === "copy") {
+      var txt = O.rows.map(function (r) {
+        return hhmm(r.created_at) + " · " + r.author_name + " · " + (r.sent_at ? r.via : "queued") +
+          " · " + r.reachable + "/" + r.others + " · " + r.preview;
+      }).join("\n");
+      try { await navigator.clipboard.writeText(txt); say("Журнал скопирован"); sfx("tap"); }
+      catch (x) { say("Не удалось скопировать", "danger"); }
+      return;
+    }
+  }, true);
+
+  document.addEventListener("change", function (e) {
+    if (e.target.dataset && e.target.dataset.op === "auto") {
+      O.auto = e.target.checked;
+      if (O.auto) attach(); else detach();
+      O.last = ""; paint(); sfx("tap");
+    }
+  }, true);
+
+  if (typeof window.renderChat === "function" && !window.renderChat.__opWrapped) {
+    var _rc = window.renderChat;
+    var w = function () { var r = _rc.apply(this, arguments); setTimeout(sync, 50); return r; };
+    w.__opWrapped = true;
+    window.renderChat = w;
+  }
+  if (typeof window.go === "function" && !window.go.__opWrapped) {
+    var _g = window.go;
+    var g = function (v) { var r = _g.apply(this, arguments); if (v === "chat") setTimeout(sync, 450); return r; };
+    g.__opWrapped = true;
+    window.go = g;
+  }
+
+  var tries = 0;
+  var boot = setInterval(function () {
+    tries++;
+    if (mem() && typeof client !== "undefined" && client) { clearInterval(boot); attach(); sync(); }
+    if (tries > 80) clearInterval(boot);
+  }, 500);
+
+  window.HifzOperator = { dispatch: dispatch, refresh: function () { return loadLog().then(paint); }, state: O };
+})();
+           </script>   
 </body>
    </html>
