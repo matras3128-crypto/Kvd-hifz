@@ -1,6 +1,13 @@
 <!DOCTYPE html>
 <html lang="ru" data-theme="light">
 <head>
+<!-- ВСТАВИТЬ В <head> файла index.html -->
+<link rel="manifest" href="/manifest.json" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Хифз" />
+<link rel="apple-touch-icon" href="/logo.png" />   
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#f4f8fd" />
@@ -6375,5 +6382,527 @@ initCloud();
   setTimeout(function () { mountChip(); decorate(); }, 2500);
 })();
      </script>   
+   <script>
+/* ==========================================================
+   HIFZ PUSH CENTER — вставить ПОСЛЕ всех хотфиксов, ПЕРЕД </body>
+   ========================================================== */
+(function () {
+  if (window.__hifzPush) return;
+  window.__hifzPush = true;
+
+  var SW_URL = "/sw.js";
+  var S = {
+    reg: null, sub: null, perm: "default", vapid: "", devices: [], busy: false,
+    prefs: { chat: true, requests: true, reviews: true, quiet_on: false, quiet_from: "23:00", quiet_to: "07:00", tz_offset: 0 },
+    keys: null
+  };
+
+  var UA = navigator.userAgent || "";
+  var IS_IOS = /iPad|iPhone|iPod/.test(UA) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  var STANDALONE = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  var SUPPORTED = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function owner() { try { return typeof isOwner === "function" && isOwner(); } catch (e) { return false; } }
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s); } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+  function err(e) { try { return humanError(e); } catch (x) { return String(e && e.message || e); } }
+
+  function b64urlToBytes(s) {
+    var pad = "=".repeat((4 - s.length % 4) % 4);
+    var raw = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function bytesToB64url(buf) {
+    var b = new Uint8Array(buf), s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  async function generateVapid() {
+    var kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    var pub = await crypto.subtle.exportKey("raw", kp.publicKey);
+    var jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    return { publicKey: bytesToB64url(pub), privateKey: jwk.d };
+  }
+
+  /* ---------- данные ---------- */
+  async function loadConfig() {
+    try {
+      var r = await client.from("hifz_push_config").select("vapid_public").eq("id", 1).maybeSingle();
+      S.vapid = (r.data && r.data.vapid_public) || "";
+    } catch (e) { S.vapid = ""; }
+  }
+
+  async function loadPrefs() {
+    var m = mem(); if (!m) return;
+    try {
+      var r = await client.from("hifz_push_prefs").select("*").eq("user_id", m.user_id).maybeSingle();
+      if (r.data) S.prefs = Object.assign(S.prefs, r.data);
+      else {
+        S.prefs.tz_offset = -new Date().getTimezoneOffset();
+        await client.from("hifz_push_prefs").upsert({ user_id: m.user_id, tz_offset: S.prefs.tz_offset });
+      }
+    } catch (e) {}
+  }
+
+  async function savePrefs() {
+    var m = mem(); if (!m) return;
+    S.prefs.tz_offset = -new Date().getTimezoneOffset();
+    var r = await client.from("hifz_push_prefs").upsert({
+      user_id: m.user_id, chat: S.prefs.chat, requests: S.prefs.requests, reviews: S.prefs.reviews,
+      quiet_on: S.prefs.quiet_on, quiet_from: S.prefs.quiet_from, quiet_to: S.prefs.quiet_to,
+      tz_offset: S.prefs.tz_offset, updated_at: new Date().toISOString()
+    });
+    if (r.error) throw r.error;
+  }
+
+  async function loadDevices() {
+    var m = mem(); if (!m) { S.devices = []; return; }
+    try {
+      var r = await client.from("hifz_push_subs").select("*").eq("user_id", m.user_id).order("created_at", { ascending: false });
+      S.devices = r.data || [];
+    } catch (e) { S.devices = []; }
+  }
+
+  async function ensureSW() {
+    if (!SUPPORTED) return null;
+    if (S.reg) return S.reg;
+    S.reg = await navigator.serviceWorker.register(SW_URL, { scope: "/" });
+    await navigator.serviceWorker.ready;
+    S.perm = Notification.permission;
+    S.sub = await S.reg.pushManager.getSubscription();
+    return S.reg;
+  }
+
+  async function refresh() {
+    await ensureSW().catch(function () {});
+    await loadConfig();
+    await loadPrefs();
+    await loadDevices();
+    if (SUPPORTED) S.perm = Notification.permission;
+    paintBell();
+  }
+
+  /* ---------- подписка ---------- */
+  async function enable() {
+    var m = mem();
+    if (!m) { say("Сначала войди в аккаунт", "danger"); return; }
+    if (!SUPPORTED) { say("Этот браузер не поддерживает push", "danger"); return; }
+    if (!S.vapid) { say("Владелец ещё не настроил ключ уведомлений", "danger"); return; }
+
+    S.busy = true; render();
+    try {
+      var reg = await ensureSW();
+      var perm = await Notification.requestPermission();
+      S.perm = perm;
+      if (perm !== "granted") {
+        say("Разрешение не выдано. Включи уведомления в настройках браузера.", "danger");
+        return;
+      }
+
+      var sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: b64urlToBytes(S.vapid)
+        });
+      }
+      S.sub = sub;
+
+      var j = sub.toJSON();
+      var r = await client.from("hifz_push_subs").upsert({
+        endpoint: j.endpoint,
+        user_id: m.user_id,
+        p256dh: j.keys.p256dh,
+        auth: j.keys.auth,
+        ua: UA.slice(0, 240),
+        platform: IS_IOS ? "iOS" : /Android/.test(UA) ? "Android" : "Desktop",
+        seen_at: new Date().toISOString()
+      }, { onConflict: "endpoint" });
+      if (r.error) throw r.error;
+
+      await savePrefs();
+      await loadDevices();
+      say("Уведомления включены на этом устройстве");
+      try { Sound.play("ok"); } catch (e) {}
+      localTest();
+    } catch (e) {
+      say(err(e), "danger");
+    } finally {
+      S.busy = false; render(); paintBell();
+    }
+  }
+
+  async function disable() {
+    S.busy = true; render();
+    try {
+      if (S.sub) {
+        var ep = S.sub.endpoint;
+        await S.sub.unsubscribe().catch(function () {});
+        await client.from("hifz_push_subs").delete().eq("endpoint", ep);
+        S.sub = null;
+      }
+      await loadDevices();
+      say("Уведомления отключены на этом устройстве", "info");
+    } catch (e) { say(err(e), "danger"); }
+    finally { S.busy = false; render(); paintBell(); }
+  }
+
+  async function removeDevice(endpoint) {
+    var r = await client.from("hifz_push_subs").delete().eq("endpoint", endpoint);
+    if (r.error) throw r.error;
+    if (S.sub && S.sub.endpoint === endpoint) {
+      await S.sub.unsubscribe().catch(function () {});
+      S.sub = null;
+    }
+    await loadDevices(); render(); paintBell();
+    say("Устройство удалено", "info");
+  }
+
+  function localTest() {
+    if (!S.reg || !S.reg.active) { say("Service worker ещё не готов", "danger"); return; }
+    S.reg.active.postMessage({
+      type: "hifz-test",
+      title: "Журнал хифза",
+      body: "Локальная проверка: уведомления отображаются. Нажми, чтобы открыть журнал."
+    });
+    say("Тестовое уведомление отправлено", "info");
+  }
+
+  async function serverTest() {
+    try {
+      var r = await rpc("hifz_push_test");
+      if (r.error) throw r.error;
+      say("Сервер отправил push. Проверь шторку уведомлений.", "info");
+    } catch (e) { say(err(e), "danger"); }
+  }
+
+  /* ---------- интерфейс ---------- */
+  var BELL = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>';
+
+  function paintBell() {
+    var host = document.getElementById("topActions");
+    if (!host || !mem()) return;
+    var b = document.getElementById("hifzBell");
+    if (!b) {
+      b = document.createElement("button");
+      b.id = "hifzBell";
+      b.className = "icon-btn hifz-bell";
+      b.dataset.hpf = "open";
+      b.innerHTML = BELL + '<i class="hifz-bell-dot"></i>';
+      host.insertBefore(b, host.firstChild);
+    }
+    var on = !!S.sub && S.perm === "granted";
+    b.classList.toggle("on", on);
+    b.classList.toggle("nudge", !on);
+    b.title = on ? "Уведомления включены" : "Настроить уведомления";
+  }
+
+  function statusBlock() {
+    if (!SUPPORTED) {
+      if (IS_IOS && !STANDALONE) {
+        return '<div class="hp-card warn"><b>Нужно установить приложение</b>' +
+          '<p>На iPhone push работает только из установленного приложения. Нажми <b>Поделиться</b> → <b>На экран «Домой»</b>, открой иконку и вернись сюда.</p>' +
+          '<div class="hp-steps"><span>1. Safari → кнопка «Поделиться»</span><span>2. «На экран Домой»</span><span>3. Открыть иконку «Хифз»</span><span>4. Включить уведомления здесь</span></div></div>';
+      }
+      return '<div class="hp-card bad"><b>Браузер не поддерживает push</b><p>Открой сайт в Chrome, Edge, Firefox или Safari 16.4+.</p></div>';
+    }
+    if (S.perm === "denied") {
+      return '<div class="hp-card bad"><b>Уведомления заблокированы</b><p>Браузер запретил показ. Нажми на замок слева от адреса → Уведомления → Разрешить, затем обнови страницу.</p></div>';
+    }
+    if (!S.vapid) {
+      return '<div class="hp-card warn"><b>Ключ ещё не настроен</b><p>Владелец должен сгенерировать VAPID-ключи в блоке ниже. Без них подписка невозможна.</p></div>';
+    }
+    if (S.sub && S.perm === "granted") {
+      return '<div class="hp-card good"><b>Уведомления активны</b><p>Сообщения чата, заявки и утренние напоминания придут на это устройство даже при закрытой вкладке.</p></div>';
+    }
+    return '<div class="hp-card idle"><b>Уведомления выключены</b><p>Включи, чтобы получать сообщения чата и заявки как обычные push-уведомления телефона.</p></div>';
+  }
+
+  function checks() {
+    var rows = [
+      ["Service worker", !!S.reg],
+      ["Разрешение браузера", S.perm === "granted"],
+      ["Push-подписка", !!S.sub],
+      ["Ключ сервера", !!S.vapid],
+      ["Сохранено в базе", S.devices.length > 0]
+    ];
+    return '<div class="hp-checks">' + rows.map(function (r) {
+      return '<div class="hp-check ' + (r[1] ? "ok" : "") + '"><i></i><span>' + r[0] + '</span></div>';
+    }).join("") + '</div>';
+  }
+
+  function toggleRow(key, title, sub) {
+    return '<label class="hp-toggle"><span class="hp-toggle-main"><b>' + title + '</b><small>' + sub + '</small></span>' +
+      '<input type="checkbox" data-hppref="' + key + '" ' + (S.prefs[key] ? "checked" : "") + '><i class="hp-switch"></i></label>';
+  }
+
+  function deviceRow(d) {
+    var current = S.sub && S.sub.endpoint === d.endpoint;
+    var name = d.platform === "iOS" ? "iPhone / iPad" : d.platform === "Android" ? "Android" : "Компьютер";
+    var when = "";
+    try { when = fmtDay.format(new Date(d.created_at)) + " · " + fmtTime.format(new Date(d.created_at)); } catch (e) {}
+    return '<div class="hp-device">' +
+      '<span class="hp-dev-ic">' + (d.platform === "Desktop" ? "🖥" : "📱") + '</span>' +
+      '<span class="hp-dev-main"><b>' + name + (current ? ' <em>это устройство</em>' : "") + '</b><small>' + E(when) + '</small></span>' +
+      '<button class="icon-btn hp-dev-x" data-hpf="dev-remove" data-ep="' + E(d.endpoint) + '" title="Удалить">✕</button>' +
+      '</div>';
+  }
+
+  function ownerBlock() {
+    if (!owner()) return "";
+    var k = S.keys;
+    return '<div class="hp-section"><h4>Ключи сервера · только владелец</h4>' +
+      '<p class="hp-note">Публичный ключ хранится в базе, приватный — только в Supabase Secrets. Приватный ключ больше нигде не сохраняется: скопируй его сразу.</p>' +
+      '<div class="hp-keyline"><span>Текущий публичный ключ</span><code>' + (S.vapid ? E(S.vapid.slice(0, 42)) + "…" : "не задан") + '</code></div>' +
+      '<button class="btn soft block" data-hpf="gen">' + (k ? "Сгенерировать заново" : "Сгенерировать ключи") + '</button>' +
+      (k ?
+        '<div class="hp-keys">' +
+          '<label class="hp-key"><span>Публичный ключ</span><textarea readonly rows="2">' + E(k.publicKey) + '</textarea>' +
+            '<button class="btn ghost sm" data-hpf="copy" data-val="' + E(k.publicKey) + '">Копировать</button></label>' +
+          '<label class="hp-key"><span>Приватный ключ → Secret VAPID_PRIVATE_KEY</span><textarea readonly rows="2">' + E(k.privateKey) + '</textarea>' +
+            '<button class="btn ghost sm" data-hpf="copy" data-val="' + E(k.privateKey) + '">Копировать</button></label>' +
+          '<button class="btn primary block" data-hpf="save-key">Сохранить публичный ключ в базу</button>' +
+          '<div class="hp-steps"><span>Edge Functions → Secrets → VAPID_PUBLIC_KEY</span><span>Edge Functions → Secrets → VAPID_PRIVATE_KEY</span><span>Edge Functions → Secrets → PUSH_SECRET</span><span>Verify JWT = OFF</span></div>' +
+        '</div>' : "") +
+      '</div>';
+  }
+
+  function render() {
+    var body = document.getElementById("hpBody");
+    if (!body) return;
+    var active = !!S.sub && S.perm === "granted";
+
+    body.innerHTML =
+      statusBlock() +
+      checks() +
+      '<div class="hp-main-actions">' +
+        (active
+          ? '<button class="btn outline-danger block" data-hpf="disable"' + (S.busy ? " disabled" : "") + '>Отключить на этом устройстве</button>'
+          : '<button class="btn primary block" data-hpf="enable"' + (S.busy || !SUPPORTED || !S.vapid ? " disabled" : "") + '>' + (S.busy ? "Включаем…" : "Включить уведомления") + '</button>') +
+        '<div class="hp-test-row">' +
+          '<button class="btn soft" data-hpf="test-local"' + (!S.reg ? " disabled" : "") + '>Локальный тест</button>' +
+          '<button class="btn soft" data-hpf="test-server"' + (!active ? " disabled" : "") + '>Тест с сервера</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="hp-section"><h4>Что присылать</h4>' +
+        toggleRow("chat", "Сообщения чата", "Личные и групповые, включая фото") +
+        toggleRow("requests", "Заявки на сдачу", "Новые заявки и результат проверки") +
+        toggleRow("reviews", "Повторения утром", "Ежедневно в 08:00 по Москве, если есть что повторять") +
+      '</div>' +
+      '<div class="hp-section"><h4>Тихие часы</h4>' +
+        toggleRow("quiet_on", "Не беспокоить ночью", "В этот интервал push не отправляются") +
+        '<div class="hp-quiet ' + (S.prefs.quiet_on ? "on" : "") + '">' +
+          '<label>С<input type="time" data-hppref="quiet_from" value="' + E(S.prefs.quiet_from) + '"></label>' +
+          '<label>До<input type="time" data-hppref="quiet_to" value="' + E(S.prefs.quiet_to) + '"></label>' +
+        '</div>' +
+      '</div>' +
+      '<div class="hp-section"><h4>Устройства · ' + S.devices.length + '</h4>' +
+        (S.devices.length ? S.devices.map(deviceRow).join("") : '<div class="empty-list" style="padding:14px">Подписанных устройств нет.</div>') +
+      '</div>' +
+      ownerBlock();
+  }
+
+  function openPanel() {
+    var html =
+      '<button class="drawer-x" data-hpf="close">✕</button>' +
+      '<h3>Уведомления</h3>' +
+      '<p class="drawer-note">Настоящие push на телефон и компьютер — без почты и без открытых вкладок.</p>' +
+      '<div id="hpBody"></div>';
+    try { openDrawer(html); } catch (e) { return; }
+    render();
+    refresh().then(render);
+  }
+
+  /* ---------- стили ---------- */
+  if (!document.getElementById("hifz-push-css")) {
+    var st = document.createElement("style");
+    st.id = "hifz-push-css";
+    st.textContent = [
+      ".hifz-bell{position:relative}",
+      ".hifz-bell.on{color:var(--green);border-color:color-mix(in srgb,var(--green) 40%,var(--line))}",
+      ".hifz-bell-dot{position:absolute;top:6px;right:6px;width:7px;height:7px;border-radius:50%;background:var(--faint);display:none}",
+      ".hifz-bell.nudge .hifz-bell-dot{display:block;background:var(--amber);animation:hpNudge 1.9s ease-in-out infinite}",
+      ".hifz-bell.on .hifz-bell-dot{display:block;background:var(--green);animation:none}",
+      "@keyframes hpNudge{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.45);opacity:.55}}",
+      ".hp-card{border-radius:14px;padding:13px 15px;margin-bottom:14px;border:1px solid var(--line)}",
+      ".hp-card b{display:block;font-size:13.5px;font-weight:800;margin-bottom:4px}",
+      ".hp-card p{font-size:12.5px;font-weight:500;line-height:1.55;color:var(--muted)}",
+      ".hp-card.good{background:var(--green-soft);border-color:color-mix(in srgb,var(--green) 30%,var(--line))}",
+      ".hp-card.good b{color:var(--green)}",
+      ".hp-card.warn{background:var(--amber-soft);border-color:color-mix(in srgb,var(--amber) 30%,var(--line))}",
+      ".hp-card.warn b{color:var(--amber)}",
+      ".hp-card.bad{background:var(--red-soft);border-color:color-mix(in srgb,var(--red) 30%,var(--line))}",
+      ".hp-card.bad b{color:var(--red)}",
+      ".hp-card.idle{background:var(--blue-soft);border-color:var(--line2)}",
+      ".hp-card.idle b{color:var(--blue2)}",
+      ".hp-steps{display:flex;flex-direction:column;gap:5px;margin-top:10px}",
+      ".hp-steps span{font-size:11.5px;font-weight:700;color:var(--muted);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:5px 9px}",
+      ".hp-checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:6px;margin-bottom:15px}",
+      ".hp-check{display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:700;color:var(--muted);background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:7px 10px}",
+      ".hp-check i{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}",
+      ".hp-check.ok{color:var(--green);border-color:color-mix(in srgb,var(--green) 26%,var(--line))}",
+      ".hp-check.ok i{background:var(--green);box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 18%,transparent)}",
+      ".hp-main-actions{display:flex;flex-direction:column;gap:9px;margin-bottom:6px}",
+      ".hp-test-row{display:flex;gap:8px}",
+      ".hp-test-row .btn{flex:1}",
+      ".hp-section{border-top:1px solid var(--line);padding-top:15px;margin-top:16px}",
+      ".hp-section h4{font-size:12px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:11px}",
+      ".hp-toggle{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;background:var(--surface2);border:1px solid var(--line);cursor:pointer;margin-bottom:7px;transition:.15s}",
+      ".hp-toggle:hover{border-color:var(--line2)}",
+      ".hp-toggle-main{flex:1;min-width:0}",
+      ".hp-toggle-main b{display:block;font-size:13px;font-weight:800;color:var(--ink)}",
+      ".hp-toggle-main small{display:block;font-size:11px;font-weight:600;color:var(--muted);margin-top:2px}",
+      ".hp-toggle input{position:absolute;opacity:0;width:1px;height:1px;min-height:0}",
+      ".hp-switch{width:42px;height:24px;border-radius:12px;background:var(--line2);position:relative;flex:none;transition:.2s}",
+      ".hp-switch::after{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.2s;box-shadow:0 1px 4px rgba(0,0,0,.25)}",
+      ".hp-toggle input:checked+.hp-switch{background:linear-gradient(135deg,var(--blue3),var(--blue2))}",
+      ".hp-toggle input:checked+.hp-switch::after{transform:translateX(18px)}",
+      ".hp-toggle input:focus-visible+.hp-switch{box-shadow:0 0 0 3px var(--blue-soft)}",
+      ".hp-quiet{display:flex;gap:10px;opacity:.4;pointer-events:none;transition:.2s}",
+      ".hp-quiet.on{opacity:1;pointer-events:auto}",
+      ".hp-quiet label{flex:1;display:flex;flex-direction:column;gap:5px;font-size:11.5px;font-weight:700;color:var(--muted)}",
+      ".hp-device{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:12px;background:var(--surface2);border:1px solid var(--line);margin-bottom:6px}",
+      ".hp-dev-ic{font-size:17px;flex:none}",
+      ".hp-dev-main{flex:1;min-width:0}",
+      ".hp-dev-main b{display:block;font-size:12.5px;font-weight:800}",
+      ".hp-dev-main em{font-style:normal;font-size:9.5px;font-weight:800;color:var(--green);background:var(--green-soft);padding:1px 6px;border-radius:6px;margin-left:5px}",
+      ".hp-dev-main small{display:block;font-size:11px;font-weight:600;color:var(--muted);margin-top:2px}",
+      ".hp-dev-x{width:29px;height:29px;border-radius:9px;color:var(--red);font-size:12px}",
+      ".hp-note{font-size:12px;font-weight:500;line-height:1.55;color:var(--muted);margin-bottom:11px}",
+      ".hp-keyline{display:flex;flex-direction:column;gap:4px;margin-bottom:11px}",
+      ".hp-keyline span{font-size:11px;font-weight:700;color:var(--muted)}",
+      ".hp-keyline code{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:var(--surface2);border:1px solid var(--line);border-radius:9px;padding:7px 10px;color:var(--blue2);word-break:break-all}",
+      ".hp-keys{margin-top:12px;display:flex;flex-direction:column;gap:11px}",
+      ".hp-key{display:flex;flex-direction:column;gap:6px}",
+      ".hp-key span{font-size:11px;font-weight:700;color:var(--muted)}",
+      ".hp-key textarea{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;line-height:1.5;resize:none;word-break:break-all}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- события ---------- */
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-hpf]");
+    if (!t) return;
+    var a = t.dataset.hpf;
+    e.preventDefault(); e.stopPropagation();
+
+    try {
+      if (a === "open") { openPanel(); return; }
+      if (a === "close") { closeDrawer(); return; }
+      if (a === "enable") { await enable(); return; }
+      if (a === "disable") { await disable(); return; }
+      if (a === "test-local") { localTest(); return; }
+      if (a === "test-server") { await serverTest(); return; }
+      if (a === "dev-remove") { await removeDevice(t.dataset.ep); return; }
+      if (a === "gen") {
+        S.keys = await generateVapid();
+        render();
+        say("Ключи созданы. Скопируй приватный ключ в Secrets.", "info");
+        return;
+      }
+      if (a === "copy") {
+        await navigator.clipboard.writeText(t.dataset.val);
+        say("Скопировано");
+        return;
+      }
+      if (a === "save-key") {
+        if (!S.keys) return;
+        var m = mem();
+        var r = await client.from("hifz_push_config")
+          .update({ vapid_public: S.keys.publicKey, updated_at: new Date().toISOString(), updated_by: m.user_id })
+          .eq("id", 1);
+        if (r.error) throw r.error;
+        S.vapid = S.keys.publicKey;
+        render(); paintBell();
+        say("Публичный ключ сохранён");
+        return;
+      }
+    } catch (ex) { say(err(ex), "danger"); }
+  }, true);
+
+  document.addEventListener("change", async function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.hppref) return;
+    var key = el.dataset.hppref;
+    S.prefs[key] = el.type === "checkbox" ? el.checked : el.value;
+    try {
+      await savePrefs();
+      render();
+      say("Настройки сохранены", "info");
+    } catch (ex) { say(err(ex), "danger"); }
+  }, true);
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("message", function (e) {
+      var m = e.data || {};
+      if (m.type === "hifz-open" && m.data) {
+        try {
+          var u = new URL(m.url, location.origin);
+          var v = u.searchParams.get("v");
+          if (v && typeof go === "function") go(v);
+        } catch (x) {}
+      }
+      if (m.type === "hifz-resub" && m.sub) {
+        var mm = mem(); if (!mm) return;
+        client.from("hifz_push_subs").upsert({
+          endpoint: m.sub.endpoint, user_id: mm.user_id,
+          p256dh: m.sub.keys.p256dh, auth: m.sub.keys.auth,
+          ua: UA.slice(0, 240), seen_at: new Date().toISOString()
+        }, { onConflict: "endpoint" }).then(function () { refresh(); });
+      }
+      if (m.type === "hifz-push") {
+        try { Sound.play("open"); } catch (x) {}
+      }
+    });
+  }
+
+  if (typeof window.renderHeader === "function") {
+    var _rh = window.renderHeader;
+    window.renderHeader = function () {
+      var r = _rh.apply(this, arguments);
+      paintBell();
+      return r;
+    };
+  }
+
+  window.addEventListener("focus", function () {
+    if (!mem()) return;
+    if (SUPPORTED) S.perm = Notification.permission;
+    paintBell();
+  });
+
+  (function deepLink() {
+    try {
+      var v = new URLSearchParams(location.search).get("v");
+      if (!v) return;
+      var tries = 0;
+      var t = setInterval(function () {
+        tries++;
+        if (mem() && typeof go === "function") { clearInterval(t); go(v); }
+        if (tries > 60) clearInterval(t);
+      }, 400);
+    } catch (e) {}
+  })();
+
+  (async function init() {
+    await ensureSW().catch(function () {});
+    var tries = 0;
+    var t = setInterval(async function () {
+      tries++;
+      if (mem()) {
+        clearInterval(t);
+        await refresh();
+        render();
+      }
+      if (tries > 80) clearInterval(t);
+    }, 500);
+  })();
+})();
+   </script>
 </body>
    </html>
