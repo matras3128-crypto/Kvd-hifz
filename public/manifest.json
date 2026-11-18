@@ -1,0 +1,25 @@
+{
+  "name": "Журнал хифза — KoranVdom",
+  "short_name": "Хифз",
+  "description": "Трекер заучивания Корана: сдачи, повторения, чат команды",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "background_color": "#f3f8fd",
+  "theme_color": "#1a6fd6",
+  "lang": "ru",
+  "categories": ["education", "productivity"],
+  "icons": [
+    { "src": "/logo.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/logo.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/logo.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Сегодня", "url": "/?v=today" },
+    { "name": "Чат команды", "url": "/?v=chat" },
+    { "name": "Заявки", "url": "/?v=requests" }
+  ]
+}
