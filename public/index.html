@@ -6904,5 +6904,173 @@ initCloud();
   })();
 })();
    </script>
+   -- ============================================================
+--  PUSH DIAGNOSTICS · серверная часть
+--  Supabase → SQL Editor → New query → Run
+--  Ничего не удаляет, только добавляет функции чтения.
+-- ============================================================
+
+create or replace function public.hifz_push_diag()
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  cfg text;
+  sec text;
+  v_subs jsonb;
+  v_prefs jsonb;
+  v_logs jsonb;
+  v_trig int;
+  v_job int;
+  v_msgs int;
+  v_members int;
+begin
+  if uid is null then raise exception 'NO_AUTH'; end if;
+  if not public.hifz_is_staff() then raise exception 'FORBIDDEN'; end if;
+
+  select vapid_public into cfg from public.hifz_push_config where id = 1;
+
+  begin
+    select decrypted_secret into sec
+    from vault.decrypted_secrets where name = 'hifz_push_secret' limit 1;
+  exception when others then sec := null;
+  end;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'endpoint', endpoint,
+    'platform', platform,
+    'created_at', created_at,
+    'seen_at', seen_at,
+    'p256dh_len', length(p256dh),
+    'auth_len', length(auth)
+  ) order by created_at desc), '[]'::jsonb)
+  into v_subs
+  from public.hifz_push_subs where user_id = uid;
+
+  select to_jsonb(p) into v_prefs from public.hifz_push_prefs p where user_id = uid;
+
+  select count(*) into v_trig from pg_trigger where tgname like 'hifz_push%';
+
+  begin
+    select count(*) into v_job from cron.job where jobname = 'hifz-daily-review-push';
+  exception when others then v_job := 0;
+  end;
+
+  select count(*) into v_msgs from public.hifz_chat_messages;
+  select count(*) into v_members from public.hifz_conversation_members where user_id = uid;
+
+  begin
+    select coalesce(jsonb_agg(jsonb_build_object(
+      'status', status_code,
+      'error', error_msg,
+      'timed_out', timed_out,
+      'created', created,
+      'body', left(coalesce(content, ''), 400)
+    ) order by created desc), '[]'::jsonb)
+    into v_logs
+    from (select * from net._http_response order by created desc limit 15) t;
+  exception when others then v_logs := '[]'::jsonb;
+  end;
+
+  return jsonb_build_object(
+    'config_key_set', (cfg is not null and length(cfg) > 40),
+    'config_key_len', coalesce(length(cfg), 0),
+    'config_key', coalesce(cfg, ''),
+    'secret_set', (sec is not null and sec <> 'PUSH_SECRET_VALUE'),
+    'secret_len', coalesce(length(sec), 0),
+    'subs', v_subs,
+    'prefs', coalesce(v_prefs, '{}'::jsonb),
+    'triggers', v_trig,
+    'cron', v_job,
+    'messages', v_msgs,
+    'memberships', v_members,
+    'http_logs', v_logs,
+    'server_now', now()
+  );
+end;
+$$;
+
+grant execute on function public.hifz_push_diag() to authenticated;
+
+-- проверка канала отправки: показывает, дойдёт ли запрос до edge-функции
+create or replace function public.hifz_push_probe()
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  sec text;
+  can boolean;
+  n_subs int;
+begin
+  if uid is null then raise exception 'NO_AUTH'; end if;
+
+  begin
+    select decrypted_secret into sec
+    from vault.decrypted_secrets where name = 'hifz_push_secret' limit 1;
+  exception when others then sec := null;
+  end;
+
+  can := (sec is not null and sec <> 'PUSH_SECRET_VALUE');
+  select count(*) into n_subs from public.hifz_push_subs where user_id = uid;
+
+  if can then
+    perform public.hifz_push_send(jsonb_build_object('type', 'test', 'user_id', uid));
+  end if;
+
+  return jsonb_build_object(
+    'dispatched', can,
+    'subscriptions', n_subs,
+    'reason', case
+      when not can then 'Секрет не задан в базе — триггеры молчат'
+      when n_subs = 0 then 'Нет подписок — слать некуда'
+      else null
+    end
+  );
+end;
+$$;
+
+grant execute on function public.hifz_push_probe() to authenticated;
+
+-- отправить настоящее сообщение в общий чат (проверка всей цепочки триггеров)
+create or replace function public.hifz_push_probe_chat()
+returns jsonb
+language plpgsql security definer set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  gid uuid;
+  mid uuid;
+  m public.hifz_members;
+begin
+  if uid is null then raise exception 'NO_AUTH'; end if;
+  if not public.hifz_is_staff() then raise exception 'FORBIDDEN'; end if;
+
+  select * into m from public.hifz_members where user_id = uid;
+  if not found then raise exception 'NO_MEMBER'; end if;
+
+  select id into gid from public.hifz_conversations where is_general limit 1;
+  if gid is null then
+    gid := public.hifz_ensure_general_conversation();
+  end if;
+
+  insert into public.hifz_conversation_members (conversation_id, user_id)
+  values (gid, uid) on conflict do nothing;
+
+  insert into public.hifz_chat_messages
+    (conversation_id, user_id, author_name, author_role, body)
+  values
+    (gid, uid, coalesce(m.name, 'Диагностика'), m.role,
+     '🔔 Проверка доставки уведомлений · ' || to_char(now(), 'HH24:MI:SS'))
+  returning id into mid;
+
+  update public.hifz_conversations set updated_at = now() where id = gid;
+
+  return jsonb_build_object('message_id', mid, 'conversation_id', gid);
+end;
+$$;
+
+grant execute on function public.hifz_push_probe_chat() to authenticated;
 </body>
    </html>
