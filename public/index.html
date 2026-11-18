@@ -8114,6 +8114,164 @@ initCloud();
   window.HifzPushSetup = { mount: mount, scan: function () { return scan().then(paint); } };
   setTimeout(mount, 800);
 })();
-         </script>
+</script>
+   <script>
+/* ==========================================================
+   CHAT RECIPIENTS · вставить перед </body>
+   Показывает под полем ввода, кто реально получит push.
+   Без MutationObserver: обёртка renderChat + идемпотентная отрисовка.
+   ========================================================== */
+(function () {
+  if (window.__hifzReach) return;
+  window.__hifzReach = true;
+
+  var R = { cid: null, others: 0, reach: 0, solo: false, names: [], loaded: false, last: "", busy: false };
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+
+  function activeId() {
+    var el = document.querySelector(".cv-item.active");
+    return el ? el.dataset.id : null;
+  }
+
+  async function probe(cid) {
+    var m = mem();
+    if (!cid || !m) return;
+    R.busy = true;
+    try {
+      var mems = await client.from("hifz_conversation_members")
+        .select("user_id").eq("conversation_id", cid);
+      var ids = (mems.data || []).map(function (x) { return x.user_id; }).filter(function (x) { return x !== m.user_id; });
+      R.others = ids.length;
+
+      if (ids.length) {
+        var subs = await client.from("hifz_push_subs").select("user_id").in("user_id", ids);
+        var uniq = {};
+        (subs.data || []).forEach(function (s) { uniq[s.user_id] = true; });
+        R.reach = Object.keys(uniq).length;
+
+        var mm = await client.from("hifz_members").select("user_id,name").in("user_id", ids);
+        R.names = (mm.data || []).map(function (x) {
+          return { name: x.name || "Участник", on: !!uniq[x.user_id] };
+        });
+      } else { R.reach = 0; R.names = []; }
+
+      var pr = await client.from("hifz_push_prefs").select("solo").eq("user_id", m.user_id).maybeSingle();
+      R.solo = !!(pr.data && pr.data.solo);
+      R.loaded = true;
+    } catch (e) { R.loaded = false; }
+    R.busy = false;
+    paint();
+  }
+
+  function paint() {
+    var form = document.getElementById("cvForm");
+    if (!form) { return; }
+    var box = document.getElementById("rcBox");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "rcBox";
+      form.parentNode.insertBefore(box, form);
+    }
+
+    var total = R.reach + (R.solo ? 1 : 0);
+    var tone = total === 0 ? "zero" : R.reach < R.others ? "part" : "full";
+    var label = total === 0
+      ? "Никто не получит push"
+      : total === 1 && R.solo && R.reach === 0
+        ? "Только ты (тестовый режим)"
+        : R.reach + " из " + R.others + " получат push";
+
+    var html =
+      '<div class="rc-strip ' + tone + '">' +
+        '<span class="rc-dot"></span>' +
+        '<span class="rc-label">' + E(label) + '</span>' +
+        (R.names.length
+          ? '<span class="rc-names">' + R.names.slice(0, 4).map(function (n) {
+              return '<i class="' + (n.on ? "on" : "off") + '" title="' + E(n.name) + (n.on ? " · подключён" : " · нет подписки") + '">' + E((n.name || "?").slice(0, 1).toUpperCase()) + '</i>';
+            }).join("") + (R.names.length > 4 ? '<i class="more">+' + (R.names.length - 4) + '</i>' : "") + '</span>'
+          : "") +
+        (R.solo ? '<span class="rc-solo">solo</span>' : "") +
+        '<button class="rc-refresh" data-rc="scan" title="Пересчитать">↻</button>' +
+      '</div>' +
+      (total === 0
+        ? '<div class="rc-help">Участники не включили уведомления на своих устройствах. Себе сообщения не приходят — включи тестовый режим в панели уведомлений, чтобы проверять доставку в одиночку.</div>'
+        : R.reach < R.others
+          ? '<div class="rc-help">Часть участников без подписки — им не дойдёт, пока не включат уведомления у себя.</div>'
+          : "");
+
+    if (html === R.last) return;
+    R.last = html;
+    box.innerHTML = html;
+  }
+
+  function sync() {
+    if (!staff()) return;
+    var cid = activeId();
+    if (!cid) return;
+    if (cid !== R.cid) { R.cid = cid; R.loaded = false; R.last = ""; probe(cid); return; }
+    if (!R.loaded && !R.busy) probe(cid);
+    else paint();
+  }
+
+  if (!document.getElementById("rc-css")) {
+    var st = document.createElement("style");
+    st.id = "rc-css";
+    st.textContent = [
+      "#rcBox{padding:0 12px}",
+      ".rc-strip{display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:11px 11px 0 0;",
+      "  font-size:11.5px;font-weight:800;border:1px solid var(--line);border-bottom:0;background:var(--surface2)}",
+      ".rc-strip.zero{--rc:#cf3d3d} .rc-strip.part{--rc:#b97708} .rc-strip.full{--rc:#1e8e52}",
+      "[data-theme='dark'] .rc-strip.zero{--rc:#f06a6a}",
+      "[data-theme='dark'] .rc-strip.part{--rc:#e0a232}",
+      "[data-theme='dark'] .rc-strip.full{--rc:#4cc38a}",
+      ".rc-strip{color:var(--rc);background:color-mix(in srgb,var(--rc) 9%,var(--surface2));border-color:color-mix(in srgb,var(--rc) 26%,var(--line))}",
+      ".rc-dot{width:7px;height:7px;border-radius:50%;background:var(--rc);flex:none}",
+      ".rc-strip.zero .rc-dot{animation:rcBlink 1.4s ease-in-out infinite}",
+      "@keyframes rcBlink{50%{opacity:.3}}",
+      ".rc-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".rc-names{display:flex;gap:3px;flex:none}",
+      ".rc-names i{width:19px;height:19px;border-radius:6px;display:grid;place-items:center;font-style:normal;",
+      "  font-size:9.5px;font-weight:800;color:#fff}",
+      ".rc-names i.on{background:linear-gradient(135deg,#1e8e52,#0d94b4)}",
+      ".rc-names i.off{background:var(--line2);color:var(--muted)}",
+      ".rc-names i.more{background:var(--surface3);color:var(--muted);width:auto;padding:0 5px}",
+      ".rc-solo{font-size:9.5px;font-weight:800;padding:2px 7px;border-radius:7px;flex:none;",
+      "  background:color-mix(in srgb,#6a5ae0 16%,var(--surface));color:#6a5ae0}",
+      ".rc-refresh{border:0;background:transparent;cursor:pointer;font:inherit;font-weight:800;",
+      "  color:var(--rc);padding:2px 6px;border-radius:7px;flex:none}",
+      ".rc-refresh:hover{background:color-mix(in srgb,var(--rc) 14%,transparent)}",
+      ".rc-help{font-size:11px;font-weight:600;line-height:1.5;color:var(--muted);",
+      "  padding:8px 11px;border:1px solid var(--line);border-top:0;border-bottom:0;background:var(--surface2)}",
+      "@media(prefers-reduced-motion:reduce){.rc-strip *{animation:none!important}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  document.addEventListener("click", function (e) {
+    var t = e.target.closest("[data-rc]");
+    if (!t) return;
+    if (t.dataset.rc === "scan") { e.preventDefault(); e.stopPropagation(); R.last = ""; probe(R.cid || activeId()); }
+  }, true);
+
+  if (typeof window.renderChat === "function" && !window.renderChat.__rcWrapped) {
+    var _rc = window.renderChat;
+    var w = function () { var r = _rc.apply(this, arguments); setTimeout(sync, 40); return r; };
+    w.__rcWrapped = true;
+    window.renderChat = w;
+  }
+
+  if (typeof window.go === "function" && !window.go.__rcWrapped) {
+    var _go = window.go;
+    var g = function (v) { var r = _go.apply(this, arguments); if (v === "chat") setTimeout(sync, 400); return r; };
+    g.__rcWrapped = true;
+    window.go = g;
+  }
+
+  setTimeout(sync, 1200);
+})();
+</script>
 </body>
    </html>
