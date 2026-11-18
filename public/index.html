@@ -7708,5 +7708,323 @@ initCloud();
   mo.observe(document.body, { childList: true, subtree: true });
 })();
    </script>
+   <script>
+/* ==========================================================
+   PUSH UNLOCK — вставить ПЕРЕД </body>, после остальных
+   Убирает мёртвую кнопку: ключ → база → подписка за один проход.
+   ========================================================== */
+(function () {
+  if (window.__hifzUnlock) return;
+  window.__hifzUnlock = true;
+
+  var U = { key: "", sub: null, devices: 0, busy: false, forged: null, sound: true, step: 0, err: null };
+  var AC = null;
+
+  function tone(f, d, g, sl) {
+    if (!U.sound) return;
+    try {
+      if (typeof prefs !== "undefined" && prefs.sound === false) return;
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === "suspended") AC.resume();
+      var t = AC.currentTime, o = AC.createOscillator(), v = AC.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f, t);
+      if (sl) o.frequency.exponentialRampToValueAtTime(sl, t + d);
+      v.gain.setValueAtTime(0.0001, t);
+      v.gain.exponentialRampToValueAtTime(g, t + 0.012);
+      v.gain.exponentialRampToValueAtTime(0.0001, t + d);
+      o.connect(v).connect(AC.destination); o.start(t); o.stop(t + d + 0.04);
+    } catch (e) {}
+  }
+  function sfx(k) {
+    if (k === "forge") { tone(330, 0.09, 0.05); setTimeout(function () { tone(494, 0.09, 0.045); }, 80); setTimeout(function () { tone(740, 0.18, 0.04); }, 160); }
+    if (k === "link") { tone(523, 0.1, 0.05); setTimeout(function () { tone(784, 0.2, 0.045); }, 95); }
+    if (k === "fail") { tone(220, 0.18, 0.05, 160); }
+    if (k === "tap") { tone(560, 0.045, 0.026); }
+  }
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function own() { try { return typeof isOwner === "function" && isOwner(); } catch (e) { return false; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+  function herr(e) { try { return humanError(e); } catch (x) { return String((e && e.message) || e); } }
+
+  function toB64u(buf) {
+    var b = new Uint8Array(buf), s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromB64u(s) {
+    var p = "=".repeat((4 - s.length % 4) % 4);
+    var raw = atob((s + p).replace(/-/g, "+").replace(/_/g, "/"));
+    var o = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) o[i] = raw.charCodeAt(i);
+    return o;
+  }
+
+  async function forge() {
+    var kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    var pub = await crypto.subtle.exportKey("raw", kp.publicKey);
+    var jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+    return { pub: toB64u(pub), priv: jwk.d };
+  }
+
+  async function scan() {
+    U.err = null;
+    try {
+      var r = await client.from("hifz_push_config").select("vapid_public").eq("id", 1).maybeSingle();
+      U.key = (r.data && r.data.vapid_public) || "";
+    } catch (e) { U.key = ""; }
+    try {
+      var m = mem();
+      if (m) {
+        var d = await client.from("hifz_push_subs").select("endpoint", { count: "exact" }).eq("user_id", m.user_id);
+        U.devices = d.count || 0;
+      }
+    } catch (e) { U.devices = 0; }
+    try {
+      if ("serviceWorker" in navigator && "PushManager" in window) {
+        var reg = await navigator.serviceWorker.getRegistration("/");
+        U.sub = reg ? await reg.pushManager.getSubscription() : null;
+      }
+    } catch (e) { U.sub = null; }
+    U.step = !U.key ? 0 : !U.sub ? 1 : 2;
+  }
+
+  async function forgeAndSave() {
+    U.busy = true; paint();
+    try {
+      var k = await forge();
+      var m = mem();
+      var r = await client.from("hifz_push_config")
+        .update({ vapid_public: k.pub, updated_at: new Date().toISOString(), updated_by: m.user_id })
+        .eq("id", 1);
+      if (r.error) throw r.error;
+      U.forged = k; U.key = k.pub;
+      sfx("forge");
+      say("Ключ создан и записан в базу. Приватный — в Secrets.", "info");
+      await scan();
+    } catch (e) { U.err = herr(e); sfx("fail"); }
+    finally { U.busy = false; paint(); }
+  }
+
+  async function link() {
+    U.busy = true; paint();
+    try {
+      if (!U.key) throw new Error("Ключ в базе пуст");
+      var reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      await navigator.serviceWorker.ready;
+      var perm = await Notification.requestPermission();
+      if (perm !== "granted") throw new Error("Браузер не дал разрешение");
+
+      var sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        var cur = sub.options && sub.options.applicationServerKey ? toB64u(sub.options.applicationServerKey) : "";
+        if (cur !== U.key) { await sub.unsubscribe(); sub = null; }
+      }
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: fromB64u(U.key) });
+      }
+
+      var j = sub.toJSON(), m = mem();
+      var up = await client.from("hifz_push_subs").upsert({
+        endpoint: j.endpoint, user_id: m.user_id,
+        p256dh: j.keys.p256dh, auth: j.keys.auth,
+        ua: navigator.userAgent.slice(0, 240),
+        platform: /iPad|iPhone|iPod/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : "Desktop",
+        seen_at: new Date().toISOString()
+      }, { onConflict: "endpoint" });
+      if (up.error) throw up.error;
+
+      await client.from("hifz_push_prefs").upsert({
+        user_id: m.user_id, chat: true, requests: true, reviews: true,
+        tz_offset: -new Date().getTimezoneOffset(), updated_at: new Date().toISOString()
+      });
+
+      sfx("link");
+      say("Устройство подключено");
+      if (reg.active) reg.active.postMessage({ type: "hifz-test", title: "Журнал хифза", body: "Устройство подключено к рассылке." });
+      await scan();
+    } catch (e) { U.err = herr(e); sfx("fail"); }
+    finally { U.busy = false; paint(); }
+  }
+
+  async function unlink() {
+    U.busy = true; paint();
+    try {
+      if (U.sub) {
+        var ep = U.sub.endpoint;
+        await U.sub.unsubscribe().catch(function () {});
+        await client.from("hifz_push_subs").delete().eq("endpoint", ep);
+      }
+      await scan(); say("Устройство отключено", "info"); sfx("tap");
+    } catch (e) { U.err = herr(e); }
+    finally { U.busy = false; paint(); }
+  }
+
+  async function ping() {
+    try {
+      var r = await rpc("hifz_push_probe");
+      if (r.error) throw r.error;
+      var d = r.data || {};
+      say(d.dispatched ? (d.subscriptions ? "Запрос ушёл в рассылку" : "Подписок нет") : (d.reason || "Канал не готов"), d.dispatched && d.subscriptions ? "info" : "danger");
+      sfx("tap");
+    } catch (e) { say(herr(e), "danger"); sfx("fail"); }
+  }
+
+  function paint() {
+    var host = document.getElementById("puBox");
+    if (!host) return;
+    var labels = ["Ключ", "Подписка", "Готово"];
+    var body = "";
+
+    if (U.step === 0) {
+      body = own()
+        ? '<p class="pu-text">Публичного ключа в базе нет — поэтому подписка недоступна. Создай пару прямо сейчас: публичный уйдёт в базу, приватный скопируешь в Secrets.</p>' +
+          '<button class="pu-main" data-pu="forge"' + (U.busy ? " disabled" : "") + '>' + (U.busy ? "Создаём…" : "Создать ключ и разблокировать") + '</button>'
+        : '<p class="pu-text">Ключ ещё не настроен владельцем. Пока он не появится, подключить устройство нельзя.</p>' +
+          '<button class="pu-main ghost" data-pu="nudge">Напомнить владельцу в чат</button>';
+    } else if (U.step === 1) {
+      body = '<p class="pu-text">Ключ на месте (' + U.key.length + ' симв.). Осталось подключить это устройство — браузер спросит разрешение.</p>' +
+        '<button class="pu-main" data-pu="link"' + (U.busy ? " disabled" : "") + '>' + (U.busy ? "Подключаем…" : "Включить на этом устройстве") + '</button>';
+    } else {
+      body = '<p class="pu-text">Устройство подключено и записано в базу. Проверь доставку — запрос уйдёт напрямую тебе.</p>' +
+        '<div class="pu-row">' +
+          '<button class="pu-main" data-pu="ping">Тест доставки</button>' +
+          '<button class="pu-main ghost" data-pu="unlink">Отключить</button>' +
+        '</div>';
+    }
+
+    host.innerHTML =
+      '<div class="pu-shell s' + U.step + '">' +
+        '<div class="pu-head">' +
+          '<div class="pu-beacon"><i></i></div>' +
+          '<div class="pu-titles"><b>Подключение уведомлений</b><small>' +
+            (U.step === 0 ? "Нужен ключ" : U.step === 1 ? "Нужна подписка" : "Канал готов") +
+          '</small></div>' +
+          '<button class="pu-snd" data-pu="sound">' + (U.sound ? "🔊" : "🔇") + '</button>' +
+        '</div>' +
+        '<div class="pu-track">' + labels.map(function (l, i) {
+          return '<div class="pu-step ' + (i < U.step ? "done" : i === U.step ? "now" : "") + '"><i></i><span>' + l + '</span></div>';
+        }).join('<div class="pu-link"></div>') + '</div>' +
+        body +
+        (U.err ? '<div class="pu-err">' + E(U.err) + '</div>' : "") +
+        (U.forged ?
+          '<div class="pu-keys">' +
+            '<div class="pu-key"><span>Публичный · уже в базе</span><code>' + E(U.forged.pub.slice(0, 30)) + '…</code>' +
+              '<button data-pu="copy" data-v="' + E(U.forged.pub) + '">Копировать</button></div>' +
+            '<div class="pu-key hot"><span>Приватный → Secrets VAPID_PRIVATE_KEY</span><code>' + E(U.forged.priv) + '</code>' +
+              '<button data-pu="copy" data-v="' + E(U.forged.priv) + '">Копировать</button></div>' +
+            '<div class="pu-hint">В Secrets положи оба: VAPID_PUBLIC_KEY и VAPID_PRIVATE_KEY. Значения должны совпадать с базой символ в символ.</div>' +
+          '</div>' : "") +
+        '<div class="pu-foot">' +
+          '<span>Устройств в базе: <b>' + U.devices + '</b></span>' +
+          '<button data-pu="scan">↻ Проверить</button>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function mount() {
+    var hp = document.getElementById("hpBody");
+    if (!hp) return;
+    var box = document.getElementById("puBox");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "puBox";
+      hp.insertBefore(box, hp.firstChild);
+      scan().then(paint);
+    }
+    paint();
+  }
+
+  if (!document.getElementById("pu-css")) {
+    var st = document.createElement("style");
+    st.id = "pu-css";
+    st.textContent = [
+      ".pu-shell{--a:#1a6fd6;--b:#0d94b4;--c:#6a5ae0;--ok:#1e8e52;--bad:#cf3d3d;",
+      "  border-radius:16px;padding:16px;margin-bottom:16px;position:relative;overflow:hidden;",
+      "  background:linear-gradient(150deg,color-mix(in srgb,var(--a) 10%,var(--surface)),var(--surface));",
+      "  border:1px solid color-mix(in srgb,var(--a) 26%,var(--line))}",
+      ".pu-shell.s1{--a:#b97708;--b:#cf3d3d}",
+      ".pu-shell.s2{--a:#1e8e52;--b:#0d94b4}",
+      "[data-theme='dark'] .pu-shell{--a:#4d9fff;--b:#3ec6dd;--c:#9a8cff;--ok:#4cc38a;--bad:#f06a6a}",
+      "[data-theme='dark'] .pu-shell.s1{--a:#e0a232;--b:#f06a6a}",
+      "[data-theme='dark'] .pu-shell.s2{--a:#4cc38a;--b:#3ec6dd}",
+      ".pu-shell::after{content:'';position:absolute;right:-40px;top:-40px;width:150px;height:150px;border-radius:50%;",
+      "  background:radial-gradient(circle,color-mix(in srgb,var(--b) 22%,transparent),transparent 70%);pointer-events:none}",
+      ".pu-head{display:flex;align-items:center;gap:12px;margin-bottom:14px;position:relative}",
+      ".pu-beacon{width:34px;height:34px;border-radius:11px;flex:none;display:grid;place-items:center;",
+      "  background:linear-gradient(135deg,var(--a),var(--b));box-shadow:0 5px 16px color-mix(in srgb,var(--a) 34%,transparent)}",
+      ".pu-beacon i{width:9px;height:9px;border-radius:50%;background:#fff;animation:puBeat 1.8s ease-in-out infinite}",
+      "@keyframes puBeat{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.6}}",
+      ".pu-titles{flex:1;min-width:0}",
+      ".pu-titles b{display:block;font-size:14px;font-weight:800;letter-spacing:-.2px}",
+      ".pu-titles small{display:block;font-size:11.5px;font-weight:700;color:var(--a);margin-top:2px}",
+      ".pu-snd{width:30px;height:30px;border-radius:9px;border:1px solid var(--line2);background:var(--surface);cursor:pointer;font-size:12px}",
+      ".pu-track{display:flex;align-items:center;gap:6px;margin-bottom:14px}",
+      ".pu-step{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:800;color:var(--faint)}",
+      ".pu-step i{width:14px;height:14px;border-radius:50%;border:2px solid var(--line2);flex:none;transition:.25s}",
+      ".pu-step.done{color:var(--ok)} .pu-step.done i{border-color:var(--ok);background:var(--ok)}",
+      ".pu-step.now{color:var(--a)} .pu-step.now i{border-color:var(--a);box-shadow:0 0 0 4px color-mix(in srgb,var(--a) 18%,transparent)}",
+      ".pu-link{flex:1;height:2px;background:var(--line2);border-radius:2px}",
+      ".pu-text{font-size:12.5px;font-weight:500;line-height:1.6;color:var(--muted);margin-bottom:12px}",
+      ".pu-main{width:100%;border:0;cursor:pointer;font:inherit;font-weight:800;font-size:13.5px;min-height:46px;",
+      "  border-radius:13px;background:linear-gradient(135deg,var(--a),var(--b));color:#fff;",
+      "  box-shadow:0 7px 20px color-mix(in srgb,var(--a) 32%,transparent);transition:.16s}",
+      ".pu-main:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}",
+      ".pu-main:disabled{opacity:.5;cursor:not-allowed}",
+      ".pu-main.ghost{background:var(--surface2);color:var(--ink);border:1px solid var(--line2);box-shadow:none}",
+      ".pu-row{display:flex;gap:9px}.pu-row .pu-main{flex:1}",
+      ".pu-err{margin-top:11px;padding:10px 12px;border-radius:11px;font-size:12px;font-weight:700;",
+      "  background:color-mix(in srgb,var(--bad) 13%,var(--surface));color:var(--bad)}",
+      ".pu-keys{margin-top:13px;display:flex;flex-direction:column;gap:9px}",
+      ".pu-key{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:11px;background:var(--surface2);border:1px solid var(--line)}",
+      ".pu-key.hot{border-color:color-mix(in srgb,var(--c) 40%,var(--line));background:color-mix(in srgb,var(--c) 8%,var(--surface))}",
+      ".pu-key span{font-size:10.5px;font-weight:800;color:var(--muted);flex:none;max-width:104px;line-height:1.35}",
+      ".pu-key code{flex:1;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--a);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".pu-key.hot code{color:var(--c)}",
+      ".pu-key button{border:1px solid var(--line2);background:var(--surface);cursor:pointer;font:inherit;font-weight:800;font-size:11px;padding:5px 10px;border-radius:8px;flex:none}",
+      ".pu-key button:hover{border-color:var(--a);color:var(--a)}",
+      ".pu-hint{font-size:11px;font-weight:600;line-height:1.55;color:var(--muted)}",
+      ".pu-foot{display:flex;align-items:center;justify-content:space-between;margin-top:13px;padding-top:11px;border-top:1px solid var(--line)}",
+      ".pu-foot span{font-size:11.5px;font-weight:700;color:var(--muted)}",
+      ".pu-foot b{color:var(--a)}",
+      ".pu-foot button{border:0;background:transparent;cursor:pointer;font:inherit;font-weight:800;font-size:11.5px;color:var(--muted);padding:4px 8px;border-radius:8px}",
+      ".pu-foot button:hover{background:var(--surface2);color:var(--a)}",
+      "@media(prefers-reduced-motion:reduce){.pu-shell *{animation:none!important}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-pu]");
+    if (!t) return;
+    var a = t.dataset.pu;
+    e.preventDefault(); e.stopPropagation();
+    if (a === "forge") { await forgeAndSave(); return; }
+    if (a === "link") { await link(); return; }
+    if (a === "unlink") { await unlink(); return; }
+    if (a === "ping") { await ping(); return; }
+    if (a === "scan") { U.busy = true; paint(); await scan(); U.busy = false; paint(); sfx("tap"); return; }
+    if (a === "sound") { U.sound = !U.sound; if (U.sound) sfx("tap"); paint(); return; }
+    if (a === "copy") {
+      try { await navigator.clipboard.writeText(t.dataset.v); say("Скопировано"); sfx("tap"); }
+      catch (x) { say("Не удалось скопировать", "danger"); }
+      return;
+    }
+    if (a === "nudge") {
+      try {
+        var r = await rpc("hifz_push_probe_chat");
+        if (r.error) throw r.error;
+        say("Сообщение отправлено в общий чат", "info");
+      } catch (x) { say(herr(x), "danger"); }
+      return;
+    }
+  }, true);
+
+  var mo = new MutationObserver(function () { if (document.getElementById("hpBody")) mount(); });
+  mo.observe(document.body, { childList: true, subtree: true });
+  setTimeout(mount, 1500);
+})();
+   </script>
 </body>
    </html>
