@@ -8602,5 +8602,321 @@ initCloud();
   window.HifzOperator = { dispatch: dispatch, refresh: function () { return loadLog().then(paint); }, state: O };
 })();
            </script>   
+   <script>
+/* ==========================================================
+   SUBSCRIPTION RUNNER · вставить перед </body>
+   Пошаговая подписка с видимой причиной обрыва.
+   Без MutationObserver: обёртка openDrawer + идемпотентный рендер.
+   ========================================================== */
+(function () {
+  if (window.__hifzRunner) return;
+  window.__hifzRunner = true;
+
+  var STEPS = [
+    { id: "file",  label: "Файл воркера",    hint: "/sw.js должен отдавать JS, а не HTML" },
+    { id: "reg",   label: "Регистрация",     hint: "service worker в области /" },
+    { id: "perm",  label: "Разрешение",      hint: "браузер должен разрешить показ" },
+    { id: "key",   label: "Ключ в базе",     hint: "vapid_public, 87 символов" },
+    { id: "sub",   label: "Push-подписка",   hint: "pushManager.subscribe" },
+    { id: "row",   label: "Запись в базу",   hint: "строка в hifz_push_subs" }
+  ];
+
+  var R = { st: {}, info: {}, busy: false, running: false, sound: true, last: "", reg: null, sub: null };
+  STEPS.forEach(function (s) { R.st[s.id] = "idle"; R.info[s.id] = ""; });
+
+  var AC = null;
+  function tone(f, d, g, sl) {
+    if (!R.sound) return;
+    try {
+      if (typeof prefs !== "undefined" && prefs.sound === false) return;
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === "suspended") AC.resume();
+      var t = AC.currentTime, o = AC.createOscillator(), v = AC.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f, t);
+      if (sl) o.frequency.exponentialRampToValueAtTime(sl, t + d);
+      v.gain.setValueAtTime(.0001, t);
+      v.gain.exponentialRampToValueAtTime(g, t + .012);
+      v.gain.exponentialRampToValueAtTime(.0001, t + d);
+      o.connect(v).connect(AC.destination); o.start(t); o.stop(t + d + .04);
+    } catch (e) {}
+  }
+  function sfx(k) {
+    if (k === "step") tone(620, .05, .03);
+    if (k === "done") { tone(660, .1, .05); setTimeout(function () { tone(990, .18, .045); }, 95); }
+    if (k === "fail") tone(210, .2, .055, 150);
+    if (k === "tap") tone(560, .04, .024);
+  }
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+
+  function toB64u(buf) {
+    var b = new Uint8Array(buf), s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromB64u(s) {
+    var p = "=".repeat((4 - s.length % 4) % 4);
+    var raw = atob((s + p).replace(/-/g, "+").replace(/_/g, "/"));
+    var o = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) o[i] = raw.charCodeAt(i);
+    return o;
+  }
+
+  function set(id, state, info) {
+    R.st[id] = state;
+    R.info[id] = info || "";
+    R.last = ""; paint();
+    if (state === "ok") sfx("step");
+    if (state === "fail") sfx("fail");
+  }
+
+  var KEY = "";
+
+  async function run() {
+    if (R.running) return;
+    R.running = true; R.busy = true;
+    STEPS.forEach(function (s) { R.st[s.id] = "idle"; R.info[s.id] = ""; });
+    R.last = ""; paint();
+
+    try {
+      // 1 — файл воркера
+      set("file", "run");
+      var fr = await fetch("/sw.js", { cache: "no-store" });
+      var txt = await fr.text();
+      var ct = fr.headers.get("content-type") || "";
+      if (!fr.ok) throw { step: "file", msg: "HTTP " + fr.status + " — файла нет" };
+      if (/<!doctype|<html/i.test(txt.slice(0, 200))) throw { step: "file", msg: "Отдаётся HTML журнала вместо воркера. Положи sw.js в public/" };
+      if (!/javascript|ecmascript/i.test(ct) && !/self\.addEventListener/.test(txt)) throw { step: "file", msg: "Содержимое не похоже на service worker" };
+      set("file", "ok", txt.length + " байт · " + (ct || "без типа"));
+
+      // 2 — регистрация
+      set("reg", "run");
+      if (!("serviceWorker" in navigator)) throw { step: "reg", msg: "Браузер не поддерживает service worker" };
+      R.reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      await navigator.serviceWorker.ready;
+      if (!R.reg.active) throw { step: "reg", msg: "Воркер зарегистрирован, но не активен" };
+      set("reg", "ok", "область " + R.reg.scope);
+
+      // 3 — разрешение
+      set("perm", "run");
+      if (!("Notification" in window)) throw { step: "perm", msg: "Notification недоступен. На iOS нужно установить сайт на домашний экран" };
+      var perm = Notification.permission;
+      if (perm !== "granted") perm = await Notification.requestPermission();
+      if (perm !== "granted") throw { step: "perm", msg: perm === "denied" ? "Запрещено. Сбрось через замок в адресной строке" : "Разрешение не выдано" };
+      set("perm", "ok", "granted");
+
+      // 4 — ключ
+      set("key", "run");
+      var kr = await client.from("hifz_push_config").select("vapid_public").eq("id", 1).maybeSingle();
+      if (kr.error) throw { step: "key", msg: kr.error.message };
+      KEY = (kr.data && kr.data.vapid_public) || "";
+      if (KEY.length < 80) throw { step: "key", msg: "Ключ пуст или короткий (" + KEY.length + "). Задай в базе тот же, что в Secrets" };
+      set("key", "ok", KEY.length + " симв. · " + KEY.slice(0, 10) + "…");
+
+      // 5 — подписка
+      set("sub", "run");
+      var old = await R.reg.pushManager.getSubscription();
+      if (old) {
+        var cur = old.options && old.options.applicationServerKey ? toB64u(old.options.applicationServerKey) : "";
+        if (cur !== KEY) { await old.unsubscribe(); old = null; }
+      }
+      R.sub = old || await R.reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: fromB64u(KEY) });
+      set("sub", "ok", R.sub.endpoint.slice(0, 42) + "…");
+
+      // 6 — запись
+      set("row", "run");
+      var m = mem();
+      if (!m) throw { step: "row", msg: "Нет входа в аккаунт" };
+      var j = R.sub.toJSON();
+      var up = await client.from("hifz_push_subs").upsert({
+        endpoint: j.endpoint, user_id: m.user_id,
+        p256dh: j.keys.p256dh, auth: j.keys.auth,
+        ua: navigator.userAgent.slice(0, 240),
+        platform: /iPad|iPhone|iPod/.test(navigator.userAgent) ? "iOS" : /Android/.test(navigator.userAgent) ? "Android" : "Desktop",
+        seen_at: new Date().toISOString()
+      }, { onConflict: "endpoint" });
+      if (up.error) throw { step: "row", msg: up.error.message };
+
+      await client.from("hifz_push_prefs").upsert({
+        user_id: m.user_id, chat: true, requests: true, reviews: true,
+        tz_offset: -new Date().getTimezoneOffset(), updated_at: new Date().toISOString()
+      });
+
+      var cnt = await client.from("hifz_push_subs").select("endpoint", { count: "exact" }).eq("user_id", m.user_id);
+      set("row", "ok", "устройств: " + (cnt.count || 0));
+      sfx("done");
+      say("Подписка готова. Отправь тест доставки.");
+      if (R.reg.active) R.reg.active.postMessage({ type: "hifz-test", title: "Журнал хифза", body: "Подписка оформлена." });
+
+    } catch (e) {
+      var sid = e && e.step ? e.step : (STEPS.find(function (s) { return R.st[s.id] === "run"; }) || {}).id;
+      if (sid) set(sid, "fail", (e && (e.msg || e.message)) || String(e));
+      say("Обрыв на шаге: " + (sid || "?"), "danger");
+    } finally {
+      R.running = false; R.busy = false; R.last = ""; paint();
+    }
+  }
+
+  async function reset() {
+    R.busy = true; R.last = ""; paint();
+    try {
+      var reg = await navigator.serviceWorker.getRegistration("/");
+      var sub = reg ? await reg.pushManager.getSubscription() : null;
+      if (sub) {
+        var ep = sub.endpoint;
+        await sub.unsubscribe().catch(function () {});
+        await client.from("hifz_push_subs").delete().eq("endpoint", ep);
+      }
+      STEPS.forEach(function (s) { R.st[s.id] = "idle"; R.info[s.id] = ""; });
+      say("Подписка сброшена", "info"); sfx("tap");
+    } catch (e) { say("Не удалось сбросить", "danger"); }
+    R.busy = false; R.last = ""; paint();
+  }
+
+  async function probeFile() {
+    R.busy = true; set("file", "run");
+    try {
+      var r = await fetch("/sw.js", { cache: "no-store" });
+      var t = await r.text();
+      var bad = /<!doctype|<html/i.test(t.slice(0, 200));
+      set("file", r.ok && !bad ? "ok" : "fail",
+        r.ok ? (bad ? "HTML вместо JS — файл не в той папке" : t.length + " байт") : "HTTP " + r.status);
+    } catch (e) { set("file", "fail", String(e && e.message || e)); }
+    R.busy = false; R.last = ""; paint();
+  }
+
+  function paint() {
+    var box = document.getElementById("srBox");
+    if (!box) return;
+    var okCount = STEPS.filter(function (s) { return R.st[s.id] === "ok"; }).length;
+    var failed = STEPS.find(function (s) { return R.st[s.id] === "fail"; });
+
+    var html =
+      '<div class="sr-shell ' + (failed ? "bad" : okCount === STEPS.length ? "ok" : "idle") + '">' +
+        '<div class="sr-head">' +
+          '<span class="sr-led"></span>' +
+          '<div class="sr-t"><b>Оформление подписки</b><small>' + okCount + ' / ' + STEPS.length + ' шагов</small></div>' +
+          '<button class="sr-snd" data-sr="sound">' + (R.sound ? "🔊" : "🔇") + '</button>' +
+        '</div>' +
+        '<div class="sr-steps">' + STEPS.map(function (s, i) {
+          var st = R.st[s.id];
+          return '<div class="sr-step ' + st + '" style="--i:' + i + '">' +
+            '<span class="sr-num">' + (st === "ok" ? "✓" : st === "fail" ? "!" : st === "run" ? "" : (i + 1)) + '</span>' +
+            '<span class="sr-body"><b>' + E(s.label) + '</b>' +
+              '<small>' + E(R.info[s.id] || s.hint) + '</small></span>' +
+          '</div>';
+        }).join("") + '</div>' +
+        (failed ? '<div class="sr-fix"><b>Обрыв: ' + E(failed.label) + '</b><span>' + E(R.info[failed.id]) + '</span></div>' : "") +
+        '<div class="sr-tools">' +
+          '<button class="sr-main" data-sr="run"' + (R.busy ? " disabled" : "") + '>' + (R.running ? "Выполняем…" : "Запустить подписку") + '</button>' +
+          '<button class="sr-tool" data-sr="file">Проверить воркер</button>' +
+          '<button class="sr-tool" data-sr="reset">Сбросить</button>' +
+          '<button class="sr-tool" data-sr="copy">Отчёт</button>' +
+        '</div>' +
+      '</div>';
+
+    if (html === R.last) return;
+    R.last = html;
+    box.innerHTML = html;
+  }
+
+  function mount() {
+    var hp = document.getElementById("hpBody");
+    if (!hp) return;
+    var box = document.getElementById("srBox");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "srBox";
+      hp.insertBefore(box, hp.firstChild);
+      R.last = "";
+    }
+    paint();
+  }
+
+  if (!document.getElementById("sr-css")) {
+    var st = document.createElement("style");
+    st.id = "sr-css";
+    st.textContent = [
+      ".sr-shell{--s:#0d94b4;--s2:#6a5ae0;--ok:#1e8e52;--bad:#cf3d3d;",
+      "  border-radius:15px;padding:15px;margin-bottom:15px;",
+      "  border:1px solid color-mix(in srgb,var(--s) 28%,var(--line));",
+      "  background:linear-gradient(155deg,color-mix(in srgb,var(--s) 9%,var(--surface)),var(--surface))}",
+      ".sr-shell.ok{--s:#1e8e52}.sr-shell.bad{--s:#cf3d3d}",
+      "[data-theme='dark'] .sr-shell{--s:#3ec6dd;--s2:#9a8cff;--ok:#4cc38a;--bad:#f06a6a}",
+      "[data-theme='dark'] .sr-shell.ok{--s:#4cc38a}[data-theme='dark'] .sr-shell.bad{--s:#f06a6a}",
+      ".sr-head{display:flex;align-items:center;gap:11px;margin-bottom:13px}",
+      ".sr-led{width:9px;height:9px;border-radius:50%;background:var(--s);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,var(--s) 20%,transparent)}",
+      ".sr-shell.bad .sr-led{animation:srBlink 1.2s infinite}",
+      "@keyframes srBlink{50%{opacity:.25}}",
+      ".sr-t{flex:1;min-width:0}",
+      ".sr-t b{display:block;font-size:13.5px;font-weight:800}",
+      ".sr-t small{display:block;font-size:11.5px;font-weight:700;color:var(--s);margin-top:2px}",
+      ".sr-snd{width:29px;height:29px;border-radius:9px;border:1px solid var(--line2);background:var(--surface);cursor:pointer;font-size:12px}",
+      ".sr-steps{display:flex;flex-direction:column;gap:0;margin-bottom:12px}",
+      ".sr-step{display:flex;align-items:center;gap:11px;padding:7px 4px;position:relative;",
+      "  animation:srIn .3s ease-out both;animation-delay:calc(var(--i)*40ms)}",
+      "@keyframes srIn{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}",
+      ".sr-step::before{content:'';position:absolute;left:14px;top:-3px;bottom:-3px;width:2px;background:var(--line2)}",
+      ".sr-step:first-child::before{top:50%}.sr-step:last-child::before{bottom:50%}",
+      ".sr-step.ok::before{background:var(--ok)}",
+      ".sr-num{width:22px;height:22px;border-radius:50%;flex:none;z-index:1;display:grid;place-items:center;",
+      "  font-size:10.5px;font-weight:800;background:var(--surface);border:2px solid var(--line2);color:var(--muted)}",
+      ".sr-step.ok .sr-num{border-color:var(--ok);background:var(--ok);color:#fff}",
+      ".sr-step.fail .sr-num{border-color:var(--bad);background:var(--bad);color:#fff}",
+      ".sr-step.run .sr-num{border-color:var(--s);border-top-color:transparent;animation:srSpin .7s linear infinite}",
+      "@keyframes srSpin{to{transform:rotate(360deg)}}",
+      ".sr-body{flex:1;min-width:0}",
+      ".sr-body b{display:block;font-size:12.5px;font-weight:800}",
+      ".sr-body small{display:block;font-size:10.5px;font-weight:600;color:var(--muted);margin-top:1px;word-break:break-word}",
+      ".sr-step.fail .sr-body small{color:var(--bad)}",
+      ".sr-step.ok .sr-body small{color:var(--ok)}",
+      ".sr-fix{padding:10px 12px;border-radius:11px;margin-bottom:11px;",
+      "  background:color-mix(in srgb,var(--bad) 12%,var(--surface));border:1px solid color-mix(in srgb,var(--bad) 30%,var(--line))}",
+      ".sr-fix b{display:block;font-size:12px;font-weight:800;color:var(--bad);margin-bottom:3px}",
+      ".sr-fix span{font-size:11.5px;font-weight:600;line-height:1.5;color:var(--muted)}",
+      ".sr-tools{display:flex;gap:7px;flex-wrap:wrap}",
+      ".sr-main{flex:2;min-width:150px;border:0;cursor:pointer;font:inherit;font-weight:800;font-size:13px;min-height:44px;",
+      "  border-radius:12px;background:linear-gradient(135deg,var(--s),var(--s2));color:#fff;",
+      "  box-shadow:0 6px 18px color-mix(in srgb,var(--s) 30%,transparent);transition:.15s}",
+      ".sr-main:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}",
+      ".sr-main:disabled{opacity:.5;cursor:not-allowed}",
+      ".sr-tool{flex:1;min-width:96px;border:1px solid var(--line2);background:var(--surface);cursor:pointer;",
+      "  font:inherit;font-weight:700;font-size:11.5px;min-height:44px;border-radius:12px;color:var(--ink)}",
+      ".sr-tool:hover{border-color:var(--s);color:var(--s)}",
+      "@media(prefers-reduced-motion:reduce){.sr-shell *{animation:none!important}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-sr]");
+    if (!t) return;
+    var a = t.dataset.sr;
+    e.preventDefault(); e.stopPropagation();
+    if (a === "run") return run();
+    if (a === "file") return probeFile();
+    if (a === "reset") return reset();
+    if (a === "sound") { R.sound = !R.sound; if (R.sound) sfx("tap"); R.last = ""; paint(); return; }
+    if (a === "copy") {
+      var txt = STEPS.map(function (s) { return s.label + ": " + R.st[s.id] + " — " + (R.info[s.id] || s.hint); }).join("\n");
+      try { await navigator.clipboard.writeText(txt); say("Отчёт скопирован"); sfx("tap"); }
+      catch (x) { say("Не удалось скопировать", "danger"); }
+      return;
+    }
+  }, true);
+
+  if (typeof window.openDrawer === "function" && !window.openDrawer.__srWrapped) {
+    var _od = window.openDrawer;
+    var w = function () { var r = _od.apply(this, arguments); setTimeout(mount, 45); return r; };
+    w.__srWrapped = true;
+    window.openDrawer = w;
+  }
+
+  window.HifzRunner = { run: run, mount: mount, state: R };
+  setTimeout(mount, 1000);
+})();
+       </script>
 </body>
    </html>
