@@ -9359,5 +9359,350 @@ initCloud();
   setTimeout(mount, 1200);
 })();
        </script>
+   <script>
+/* ==========================================================
+   ПРИВЯЗКА + ЗАЯВКИ · спокойная версия в стиле журнала
+   Вставить перед </body>. Старый цветной блок скрывается сам,
+   удалять его не обязательно.
+   ========================================================== */
+(function () {
+  if (window.__hifzLinkPlain) return;
+  window.__hifzLinkPlain = true;
+
+  var old = document.getElementById("lk-css");
+  if (old) old.remove();
+
+  var L = {
+    cards: [], members: [], me: null, reqs: [],
+    q: "", onlyFree: false, busy: false,
+    surah: 1, from: 1, to: 7, note: "", last: ""
+  };
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+  function ini(s) { try { return initials(s); } catch (e) { return String(s || "?").slice(0, 2).toUpperCase(); } }
+  function surahOf(n) { try { return SURAHS[n - 1]; } catch (e) { return [n, "Сура " + n, "", 286]; } }
+  function view() { try { return ui.view; } catch (e) { return ""; } }
+
+  function errText(e) {
+    var m = String((e && e.message) || e || "");
+    if (/NOT_LINKED/.test(m)) return "Аккаунт не привязан к карточке";
+    if (/CARD_TAKEN/.test(m)) return "Карточка занята другим аккаунтом";
+    if (/NOT_STUDENT/.test(m)) return "Привязка нужна только ученицам";
+    if (/NO_CARD/.test(m)) return "Карточка не найдена";
+    if (/BAD_RANGE/.test(m)) return "Неверный диапазон аятов";
+    if (/BAD_SURAH/.test(m)) return "Неверный номер суры";
+    if (/FORBIDDEN/.test(m)) return "Недостаточно прав";
+    try { return humanError(e); } catch (x) { return m; }
+  }
+
+  async function load() {
+    var m = mem(); if (!m) return;
+    L.me = m;
+    try {
+      var c = await rpc("hifz_linkable_cards");
+      if (!c.error) L.cards = c.data || [];
+    } catch (e) {}
+    if (staff()) {
+      try {
+        var r = await client.from("hifz_members").select("*").order("created_at");
+        if (!r.error) L.members = r.data || [];
+      } catch (e) {}
+    } else {
+      try {
+        var q = await client.from("hifz_requests").select("*")
+          .eq("user_id", m.user_id).order("created_at", { ascending: false }).limit(20);
+        if (!q.error) L.reqs = q.data || [];
+      } catch (e) {}
+    }
+  }
+
+  async function doLink(userId, cardId) {
+    L.busy = true; L.last = ""; paint();
+    try {
+      var r = await rpc("hifz_link_student", { p_user: userId, p_student: cardId });
+      if (r.error) throw r.error;
+      if (L.me && userId === L.me.user_id) { try { member.student_id = cardId; } catch (e) {} }
+      say("Привязано");
+      await load();
+    } catch (e) { say(errText(e), "danger"); }
+    L.busy = false; L.last = ""; paint();
+  }
+
+  async function doUnlink(userId) {
+    L.busy = true; L.last = ""; paint();
+    try {
+      var r = await rpc("hifz_unlink_student", { p_user: userId });
+      if (r.error) throw r.error;
+      if (L.me && userId === L.me.user_id) { try { member.student_id = null; } catch (e) {} }
+      say("Привязка снята", "info");
+      await load();
+    } catch (e) { say(errText(e), "danger"); }
+    L.busy = false; L.last = ""; paint();
+  }
+
+  async function submit() {
+    L.busy = true; L.last = ""; paint();
+    try {
+      var r = await rpc("hifz_submit_request", {
+        p_surah: L.surah, p_from: L.from, p_to: L.to, p_note: L.note || null
+      });
+      if (r.error) throw r.error;
+      L.note = "";
+      say("Заявка отправлена");
+      await load();
+    } catch (e) { say(errText(e), "danger"); }
+    L.busy = false; L.last = ""; paint();
+  }
+
+  function optionsFor(userId, selected) {
+    var out = '<option value="">— не привязан —</option>';
+    L.cards.forEach(function (c) {
+      var taken = c.claimed_by && c.claimed_by !== userId;
+      out += '<option value="' + E(c.id) + '"' +
+        (c.id === selected ? " selected" : "") +
+        (taken ? " disabled" : "") + '>' +
+        E(c.name) + (c.grp ? " · " + E(c.grp) : "") + (taken ? " (занята)" : "") + '</option>';
+    });
+    return out;
+  }
+
+  function staffHTML() {
+    var students = L.members.filter(function (m) { return m.role === "student"; });
+    var free = students.filter(function (m) { return !m.student_id; }).length;
+    var list = students.filter(function (m) {
+      if (L.onlyFree && m.student_id) return false;
+      if (!L.q) return true;
+      return ((m.name || "") + " " + (m.email || "")).toLowerCase().indexOf(L.q.toLowerCase()) >= 0;
+    });
+
+    return '<section class="card lnk-card">' +
+      '<div class="lnk-head">' +
+        '<h3>Привязка аккаунтов</h3>' +
+        '<span class="lnk-meta">' + (free ? free + " без карточки" : "все привязаны") + '</span>' +
+      '</div>' +
+      '<div class="lnk-bar">' +
+        '<input class="lnk-inp" data-lnk="q" placeholder="Поиск по имени или почте" value="' + E(L.q) + '">' +
+        '<label class="lnk-chk"><input type="checkbox" data-lnk="free" ' + (L.onlyFree ? "checked" : "") + '>Только без карточки</label>' +
+        '<button class="btn ghost sm" data-lnk="refresh">Обновить</button>' +
+      '</div>' +
+      (list.length
+        ? '<div class="lnk-rows">' + list.map(function (m) {
+            return '<div class="lnk-row">' +
+              '<span class="avatar sm">' + E(ini(m.name || m.email)) + '</span>' +
+              '<span class="lnk-who"><b>' + E(m.name || m.email || "Ученица") + '</b>' +
+                '<small>' + E(m.email || "") + '</small></span>' +
+              '<select class="lnk-sel" data-lnk="sel" data-user="' + m.user_id + '">' +
+                optionsFor(m.user_id, m.student_id) + '</select>' +
+              (m.student_id ? '<button class="lnk-x" data-lnk="unlink" data-user="' + m.user_id + '" title="Отвязать">✕</button>' : "") +
+            '</div>';
+          }).join("") + '</div>'
+        : '<div class="empty-list" style="padding:16px">Учениц с аккаунтами пока нет.</div>') +
+      '<p class="lnk-help">Карточка — запись в журнале, аккаунт — логин ученицы. Привязка указывает, в чей прогресс записывать сдачи. Одна карточка — один аккаунт.</p>' +
+    '</section>';
+  }
+
+  function studentHTML() {
+    var linked = L.me && L.me.student_id;
+    var card = L.cards.find(function (c) { return c.id === linked; });
+
+    if (!linked) {
+      var free = L.cards.filter(function (c) { return !c.claimed_by && !c.archived; });
+      return '<section class="card lnk-card">' +
+        '<div class="lnk-head"><h3>Выбери свою карточку</h3><span class="lnk-meta">нужно для заявок</span></div>' +
+        '<p class="lnk-help" style="margin:0 0 12px">Учитель уже создал запись с твоим именем. Отметь её — и сдачи будут попадать в твой прогресс.</p>' +
+        (free.length
+          ? '<div class="lnk-pick">' + free.map(function (c) {
+              return '<button class="lnk-opt" data-lnk="claim" data-card="' + E(c.id) + '"' + (L.busy ? " disabled" : "") + '>' +
+                '<span class="avatar sm">' + E(ini(c.name)) + '</span>' +
+                '<span class="lnk-who"><b>' + E(c.name) + '</b><small>' + E(c.grp || "без группы") + '</small></span>' +
+              '</button>';
+            }).join("") + '</div>'
+          : '<div class="empty-list" style="padding:16px">Свободных карточек нет. Попроси учителя привязать тебя в разделе «Команда».</div>') +
+      '</section>';
+    }
+
+    var su = surahOf(L.surah);
+    var max = su[3] || 286;
+    var pending = L.reqs.filter(function (r) { return r.status === "pending"; }).length;
+    var surahOpts = "";
+    for (var i = 1; i <= 114; i++) {
+      var s = surahOf(i);
+      surahOpts += '<option value="' + i + '"' + (i === L.surah ? " selected" : "") + '>' + i + ". " + E(s[1]) + '</option>';
+    }
+
+    return '<section class="card lnk-card">' +
+      '<div class="lnk-head"><h3>Подать заявку</h3>' +
+        '<span class="lnk-meta">' + E(card ? card.name : "привязана") + (pending ? " · " + pending + " на проверке" : "") + '</span>' +
+      '</div>' +
+      '<div class="lnk-form">' +
+        '<label class="field">Сура<select data-lnk="surah">' + surahOpts + '</select></label>' +
+        '<div class="lnk-two">' +
+          '<label class="field">С аята<input type="number" data-lnk="from" min="1" max="' + max + '" value="' + L.from + '"></label>' +
+          '<label class="field">По аят<input type="number" data-lnk="to" min="1" max="' + max + '" value="' + L.to + '"></label>' +
+        '</div>' +
+        '<p class="lnk-help" style="margin:0">Всего аятов: ' + max + ' · выбрано ' + Math.max(0, L.to - L.from + 1) + '</p>' +
+        '<label class="field">Комментарий<input data-lnk="note" maxlength="200" placeholder="Необязательно" value="' + E(L.note) + '"></label>' +
+        '<button class="btn primary" data-lnk="submit"' + (L.busy ? " disabled" : "") + '>' +
+          (L.busy ? "Отправляем…" : "Отправить учителю") + '</button>' +
+      '</div>' +
+      (L.reqs.length
+        ? '<div class="lnk-hist"><h4>Мои заявки</h4>' + L.reqs.slice(0, 8).map(function (r) {
+            var s = surahOf(r.surah);
+            var cls = r.status === "approved" ? "ok" : r.status === "rejected" ? "bad" : "wait";
+            var lbl = r.status === "approved" ? "принята" : r.status === "rejected" ? "отклонена" : "на проверке";
+            return '<div class="lnk-h"><span class="lnk-tag ' + cls + '">' + lbl + '</span>' +
+              '<span class="lnk-ht">' + E(s[1]) + ' · ' + r.from_ayah + '–' + r.to_ayah + '</span></div>';
+          }).join("") + '</div>'
+        : "") +
+    '</section>';
+  }
+
+  function paint() {
+    var host = document.getElementById("lnkBox");
+    if (!host) return;
+    var html = staff() ? staffHTML() : studentHTML();
+    if (html === L.last) return;
+    L.last = html;
+    host.innerHTML = html;
+  }
+
+  function mount() {
+    var m = mem(); if (!m) return;
+    var v = view();
+    var want = staff() ? v === "team" : v === "requests";
+    var main = document.getElementById("main") || document.querySelector("main");
+    if (!main) return;
+    var box = document.getElementById("lnkBox");
+    if (!want) { if (box) box.remove(); return; }
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "lnkBox";
+      main.insertBefore(box, main.firstChild);
+      L.last = "";
+      paint();
+      load().then(function () { L.last = ""; paint(); });
+      return;
+    }
+    paint();
+  }
+
+  if (!document.getElementById("lnk-css")) {
+    var st = document.createElement("style");
+    st.id = "lnk-css";
+    st.textContent = [
+      "#lkBox{display:none!important}",
+      "#lnkBox{margin-bottom:18px}",
+      ".lnk-card{padding:18px}",
+      ".lnk-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px}",
+      ".lnk-head h3{font-size:15px;font-weight:800;letter-spacing:-.2px}",
+      ".lnk-meta{font-size:11.5px;font-weight:700;color:var(--muted)}",
+      ".lnk-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}",
+      ".lnk-inp{flex:2;min-width:160px;font:inherit;font-size:12.5px;font-weight:600;padding:8px 11px;min-height:38px;",
+      "  border-radius:10px;border:1px solid var(--line2);background:var(--surface2);color:var(--ink)}",
+      ".lnk-inp:focus{outline:none;border-color:var(--blue);background:var(--surface)}",
+      ".lnk-chk{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:var(--muted);cursor:pointer;white-space:nowrap}",
+      ".lnk-chk input{width:16px;height:16px;min-height:0;accent-color:var(--blue)}",
+      ".lnk-rows{display:flex;flex-direction:column;gap:6px;max-height:360px;overflow-y:auto;padding-right:3px}",
+      ".lnk-rows{scrollbar-width:thin;scrollbar-color:var(--line2) var(--surface2)}",
+      ".lnk-rows::-webkit-scrollbar{width:9px}",
+      ".lnk-rows::-webkit-scrollbar-track{background:var(--surface2);border-radius:7px}",
+      ".lnk-rows::-webkit-scrollbar-thumb{background:var(--line2);border-radius:7px;border:2px solid var(--surface2)}",
+      ".lnk-rows::-webkit-scrollbar-thumb:hover{background:var(--muted)}",
+      ".lnk-row{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:11px;",
+      "  background:var(--surface2);border:1px solid var(--line)}",
+      ".lnk-who{flex:1;min-width:0}",
+      ".lnk-who b{display:block;font-size:12.5px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".lnk-who small{display:block;font-size:10.5px;font-weight:600;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}",
+      ".lnk-sel{flex:1;min-width:140px;max-width:220px;font:inherit;font-size:12px;font-weight:700;padding:7px 9px;",
+      "  min-height:36px;border-radius:10px;border:1px solid var(--line2);background:var(--surface);color:var(--ink)}",
+      ".lnk-sel:focus{outline:none;border-color:var(--blue)}",
+      ".lnk-x{width:28px;height:28px;border-radius:8px;border:1px solid var(--line2);background:var(--surface);",
+      "  cursor:pointer;color:var(--muted);font-size:11px;flex:none}",
+      ".lnk-x:hover{border-color:var(--red);color:var(--red)}",
+      ".lnk-help{margin-top:12px;font-size:11.5px;font-weight:600;line-height:1.6;color:var(--muted)}",
+      ".lnk-pick{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px}",
+      ".lnk-opt{display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:11px;cursor:pointer;",
+      "  border:1px solid var(--line2);background:var(--surface2);font:inherit;text-align:left;transition:.14s}",
+      ".lnk-opt:hover:not(:disabled){border-color:var(--blue);background:var(--surface)}",
+      ".lnk-opt:disabled{opacity:.5;cursor:not-allowed}",
+      ".lnk-form{display:flex;flex-direction:column;gap:12px}",
+      ".lnk-form .btn{align-self:flex-start;min-width:190px}",
+      ".lnk-two{display:flex;gap:12px}.lnk-two .field{flex:1}",
+      ".lnk-hist{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}",
+      ".lnk-hist h4{font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:9px}",
+      ".lnk-h{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:10px;background:var(--surface2);margin-bottom:5px}",
+      ".lnk-tag{font-size:10px;font-weight:800;padding:2px 8px;border-radius:7px;flex:none;",
+      "  background:var(--surface3);color:var(--muted)}",
+      ".lnk-tag.ok{color:var(--green);background:var(--green-soft)}",
+      ".lnk-tag.bad{color:var(--red);background:var(--red-soft)}",
+      ".lnk-tag.wait{color:var(--amber);background:var(--amber-soft)}",
+      ".lnk-ht{font-size:11.5px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      "@media(max-width:600px){.lnk-row{flex-wrap:wrap}.lnk-sel{max-width:none;width:100%}.lnk-two{flex-direction:column;gap:12px}.lnk-form .btn{width:100%}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-lnk]");
+    if (!t) return;
+    var a = t.dataset.lnk;
+    if (["sel", "surah", "q", "note", "from", "to", "free"].indexOf(a) >= 0) return;
+    e.preventDefault(); e.stopPropagation();
+    if (a === "refresh") { L.busy = true; L.last = ""; paint(); await load(); L.busy = false; L.last = ""; paint(); return; }
+    if (a === "unlink") return doUnlink(t.dataset.user);
+    if (a === "claim") return doLink(L.me.user_id, t.dataset.card);
+    if (a === "submit") return submit();
+  }, true);
+
+  document.addEventListener("change", async function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.lnk) return;
+    var a = el.dataset.lnk;
+    if (a === "sel") {
+      if (!el.value) return doUnlink(el.dataset.user);
+      return doLink(el.dataset.user, el.value);
+    }
+    if (a === "surah") {
+      L.surah = Number(el.value) || 1;
+      var mx = surahOf(L.surah)[3] || 286;
+      L.from = 1; L.to = Math.min(7, mx);
+      L.last = ""; paint(); return;
+    }
+    if (a === "from" || a === "to") {
+      var m2 = surahOf(L.surah)[3] || 286;
+      L[a] = Math.min(m2, Math.max(1, Number(el.value) || 1));
+      if (L.to < L.from) L.to = L.from;
+      L.last = ""; paint(); return;
+    }
+    if (a === "free") { L.onlyFree = el.checked; L.last = ""; paint(); return; }
+  }, true);
+
+  document.addEventListener("input", function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.lnk) return;
+    if (el.dataset.lnk === "q") { L.q = el.value; L.last = ""; paint(); }
+    if (el.dataset.lnk === "note") { L.note = el.value; }
+  }, true);
+
+  if (typeof window.renderView === "function" && !window.renderView.__lnkWrapped) {
+    var _rv = window.renderView;
+    var w = function () { var r = _rv.apply(this, arguments); setTimeout(mount, 45); return r; };
+    w.__lnkWrapped = true;
+    window.renderView = w;
+  }
+  if (typeof window.go === "function" && !window.go.__lnkWrapped) {
+    var _g = window.go;
+    var g = function () { var r = _g.apply(this, arguments); setTimeout(mount, 300); return r; };
+    g.__lnkWrapped = true;
+    window.go = g;
+  }
+
+  window.HifzLinkPlain = { mount: mount, reload: function () { return load().then(paint); } };
+  setTimeout(mount, 1200);
+})();
+       </script>
 </body>
    </html>
