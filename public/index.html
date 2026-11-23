@@ -8918,5 +8918,446 @@ initCloud();
   setTimeout(mount, 1000);
 })();
        </script>
+   <script>
+/* ==========================================================
+   LINKING + REQUESTS · вставить перед </body>
+   Привязка аккаунтов к карточкам и подача заявок.
+   Без MutationObserver: обёртки renderView / go.
+   ========================================================== */
+(function () {
+  if (window.__hifzLink) return;
+  window.__hifzLink = true;
+
+  var L = {
+    cards: [], members: [], me: null, reqs: [],
+    q: "", onlyFree: false, busy: false, sound: true,
+    surah: 1, from: 1, to: 1, note: "", last: "", mode: ""
+  };
+  var AC = null;
+
+  function tone(f, d, g, sl) {
+    if (!L.sound) return;
+    try {
+      if (typeof prefs !== "undefined" && prefs.sound === false) return;
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === "suspended") AC.resume();
+      var t = AC.currentTime, o = AC.createOscillator(), v = AC.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f, t);
+      if (sl) o.frequency.exponentialRampToValueAtTime(sl, t + d);
+      v.gain.setValueAtTime(.0001, t);
+      v.gain.exponentialRampToValueAtTime(g, t + .012);
+      v.gain.exponentialRampToValueAtTime(.0001, t + d);
+      o.connect(v).connect(AC.destination); o.start(t); o.stop(t + d + .04);
+    } catch (e) {}
+  }
+  function sfx(k) {
+    if (k === "link") { tone(523, .09, .05); setTimeout(function () { tone(784, .17, .045); }, 90); }
+    if (k === "send") { tone(620, .07, .04, 880); }
+    if (k === "fail") tone(210, .2, .055, 150);
+    if (k === "tap") tone(560, .04, .024);
+  }
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function staff() { try { return typeof isStaff === "function" && isStaff(); } catch (e) { return false; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+  function surahOf(n) { try { return SURAHS[n - 1]; } catch (e) { return [n, "Сура " + n, "", 286]; } }
+  function ini(s) { try { return initials(s); } catch (e) { return String(s || "?").slice(0, 2).toUpperCase(); } }
+
+  function errText(e) {
+    var m = String((e && e.message) || e || "");
+    if (/NOT_LINKED/.test(m)) return "Аккаунт не привязан к карточке ученицы";
+    if (/CARD_TAKEN/.test(m)) return "Эта карточка уже занята другим аккаунтом";
+    if (/NOT_STUDENT/.test(m)) return "Привязка нужна только ученицам";
+    if (/NO_CARD/.test(m)) return "Карточка не найдена в журнале";
+    if (/BAD_RANGE/.test(m)) return "Неверный диапазон аятов";
+    if (/BAD_SURAH/.test(m)) return "Неверный номер суры";
+    if (/FORBIDDEN/.test(m)) return "Недостаточно прав";
+    try { return humanError(e); } catch (x) { return m; }
+  }
+
+  async function load() {
+    var m = mem(); if (!m) return;
+    L.me = m;
+    try {
+      var c = await rpc("hifz_linkable_cards");
+      if (!c.error) L.cards = c.data || [];
+    } catch (e) {}
+    if (staff()) {
+      try {
+        var r = await client.from("hifz_members").select("*").order("created_at");
+        if (!r.error) L.members = r.data || [];
+      } catch (e) {}
+    }
+    if (!staff()) {
+      try {
+        var q = await client.from("hifz_requests").select("*")
+          .eq("user_id", m.user_id).order("created_at", { ascending: false }).limit(20);
+        if (!q.error) L.reqs = q.data || [];
+      } catch (e) {}
+    }
+  }
+
+  async function doLink(userId, cardId) {
+    L.busy = true; L.last = ""; paint();
+    try {
+      var r = await rpc("hifz_link_student", { p_user: userId, p_student: cardId });
+      if (r.error) throw r.error;
+      sfx("link"); say("Аккаунт привязан");
+      if (userId === (L.me && L.me.user_id)) {
+        try { member.student_id = cardId; } catch (e) {}
+      }
+      await load();
+    } catch (e) { say(errText(e), "danger"); sfx("fail"); }
+    L.busy = false; L.last = ""; paint();
+  }
+
+  async function doUnlink(userId) {
+    L.busy = true; L.last = ""; paint();
+    try {
+      var r = await rpc("hifz_unlink_student", { p_user: userId });
+      if (r.error) throw r.error;
+      say("Привязка снята", "info"); sfx("tap");
+      if (userId === (L.me && L.me.user_id)) { try { member.student_id = null; } catch (e) {} }
+      await load();
+    } catch (e) { say(errText(e), "danger"); sfx("fail"); }
+    L.busy = false; L.last = ""; paint();
+  }
+
+  async function submit() {
+    L.busy = true; L.last = ""; paint();
+    try {
+      var r = await rpc("hifz_submit_request", {
+        p_surah: L.surah, p_from: L.from, p_to: L.to, p_note: L.note || null
+      });
+      if (r.error) throw r.error;
+      sfx("send"); say("Заявка отправлена учителю");
+      L.note = "";
+      await load();
+    } catch (e) { say(errText(e), "danger"); sfx("fail"); }
+    L.busy = false; L.last = ""; paint();
+  }
+
+  function cardOptions(selected) {
+    return '<option value="">— не привязан —</option>' + L.cards.map(function (c) {
+      var busy = c.claimed_by && c.claimed_by !== selected;
+      return '<option value="' + E(c.id) + '"' + (busy ? " disabled" : "") + '>' +
+        E(c.name) + (c.grp ? " · " + E(c.grp) : "") + (busy ? " (занята)" : "") + '</option>';
+    }).join("");
+  }
+
+  function staffBlock() {
+    var students = L.members.filter(function (m) { return m.role === "student"; });
+    var list = students.filter(function (m) {
+      if (L.onlyFree && m.student_id) return false;
+      if (!L.q) return true;
+      var s = (m.name || "") + " " + (m.email || "");
+      return s.toLowerCase().indexOf(L.q.toLowerCase()) >= 0;
+    });
+    var unlinked = students.filter(function (m) { return !m.student_id; }).length;
+
+    return '<div class="lk-shell">' +
+      '<div class="lk-head"><span class="lk-led"></span>' +
+        '<div class="lk-t"><b>Привязка аккаунтов</b><small>' +
+          (unlinked ? unlinked + " без карточки" : "все привязаны") + ' · ' + students.length + " учениц</small></div>" +
+        '<button class="lk-snd" data-lk="sound">' + (L.sound ? "🔊" : "🔇") + '</button>' +
+      '</div>' +
+      '<div class="lk-tools">' +
+        '<input class="lk-search" data-lk="q" placeholder="Поиск по имени или почте" value="' + E(L.q) + '">' +
+        '<label class="lk-tg"><input type="checkbox" data-lk="free" ' + (L.onlyFree ? "checked" : "") + '><i></i><span>Только без карточки</span></label>' +
+        '<button class="lk-tool" data-lk="refresh">↻</button>' +
+      '</div>' +
+      '<div class="lk-list">' +
+        (list.length ? list.map(function (m) {
+          var card = L.cards.find(function (c) { return c.id === m.student_id; });
+          return '<div class="lk-row ' + (m.student_id ? "on" : "off") + '">' +
+            '<span class="lk-av">' + E(ini(m.name || m.email)) + '<i></i></span>' +
+            '<span class="lk-who"><b>' + E(m.name || m.email || "Ученица") + '</b>' +
+              '<small>' + E(m.email || "") + '</small></span>' +
+            '<select class="lk-sel" data-lk="sel" data-user="' + m.user_id + '">' +
+              cardOptions(m.user_id).replace('value="' + E(m.student_id || "") + '"', 'value="' + E(m.student_id || "") + '" selected') +
+            '</select>' +
+            (m.student_id
+              ? '<button class="lk-x" data-lk="unlink" data-user="' + m.user_id + '" title="Отвязать">✕</button>'
+              : "") +
+          '</div>';
+        }).join("") : '<div class="lk-empty">Учениц с аккаунтами пока нет.</div>') +
+      '</div>' +
+      '<div class="lk-note">Карточка — запись в журнале. Аккаунт — логин ученицы. Привязка говорит системе, в чей прогресс записывать её сдачи. Одна карточка — один аккаунт.</div>' +
+    '</div>';
+  }
+
+  function studentBlock() {
+    var linked = L.me && L.me.student_id;
+    var card = L.cards.find(function (c) { return c.id === linked; });
+
+    if (!linked) {
+      var free = L.cards.filter(function (c) { return !c.claimed_by && !c.archived; });
+      return '<div class="lk-shell warn">' +
+        '<div class="lk-head"><span class="lk-led"></span>' +
+          '<div class="lk-t"><b>Найди себя в журнале</b><small>Без этого заявки не отправить</small></div>' +
+          '<button class="lk-snd" data-lk="sound">' + (L.sound ? "🔊" : "🔇") + '</button>' +
+        '</div>' +
+        '<div class="lk-note">Учитель уже создал карточку с твоим именем. Выбери её — и сдачи будут попадать в твой прогресс.</div>' +
+        '<div class="lk-pick">' +
+          (free.length ? free.map(function (c) {
+            return '<button class="lk-card" data-lk="claim" data-card="' + E(c.id) + '"' + (L.busy ? " disabled" : "") + '>' +
+              '<span class="lk-av">' + E(ini(c.name)) + '</span>' +
+              '<span><b>' + E(c.name) + '</b><small>' + E(c.grp || "без группы") + '</small></span>' +
+            '</button>';
+          }).join("") : '<div class="lk-empty">Свободных карточек нет. Попроси учителя создать карточку или привязать тебя в разделе «Команда».</div>') +
+        '</div>' +
+      '</div>';
+    }
+
+    var su = surahOf(L.surah);
+    var max = su[3] || 286;
+    var pending = L.reqs.filter(function (r) { return r.status === "pending"; }).length;
+
+    return '<div class="lk-shell ok">' +
+      '<div class="lk-head"><span class="lk-led"></span>' +
+        '<div class="lk-t"><b>Подать заявку</b><small>' + E(card ? card.name : "привязана") +
+          (pending ? " · " + pending + " на проверке" : "") + '</small></div>' +
+        '<button class="lk-snd" data-lk="sound">' + (L.sound ? "🔊" : "🔇") + '</button>' +
+      '</div>' +
+      '<div class="lk-form">' +
+        '<label class="lk-f"><span>Сура</span>' +
+          '<select data-lk="surah">' + (function () {
+            var out = "";
+            for (var i = 1; i <= 114; i++) {
+              var s = surahOf(i);
+              out += '<option value="' + i + '"' + (i === L.surah ? " selected" : "") + '>' + i + ". " + E(s[1]) + '</option>';
+            }
+            return out;
+          })() + '</select></label>' +
+        '<div class="lk-range">' +
+          '<label class="lk-f"><span>С аята</span>' +
+            '<div class="lk-step"><button data-lk="step" data-f="from" data-d="-1">−</button>' +
+            '<input type="number" data-lk="from" min="1" max="' + max + '" value="' + L.from + '">' +
+            '<button data-lk="step" data-f="from" data-d="1">+</button></div></label>' +
+          '<label class="lk-f"><span>По аят</span>' +
+            '<div class="lk-step"><button data-lk="step" data-f="to" data-d="-1">−</button>' +
+            '<input type="number" data-lk="to" min="1" max="' + max + '" value="' + L.to + '">' +
+            '<button data-lk="step" data-f="to" data-d="1">+</button></div></label>' +
+        '</div>' +
+        '<div class="lk-hint">В суре ' + max + ' аятов. Выбрано: ' + Math.max(0, L.to - L.from + 1) + '</div>' +
+        '<label class="lk-f"><span>Комментарий (необязательно)</span>' +
+          '<input data-lk="note" maxlength="200" placeholder="Например: читала по мусхафу" value="' + E(L.note) + '"></label>' +
+        '<button class="lk-main" data-lk="submit"' + (L.busy ? " disabled" : "") + '>' +
+          (L.busy ? "Отправляем…" : "Отправить учителю") + '</button>' +
+      '</div>' +
+      (L.reqs.length ?
+        '<div class="lk-hist"><b>Мои заявки</b>' + L.reqs.slice(0, 8).map(function (r) {
+          var s = surahOf(r.surah);
+          var cls = r.status === "approved" ? "ok" : r.status === "rejected" ? "bad" : "wait";
+          var lbl = r.status === "approved" ? "принята" : r.status === "rejected" ? "отклонена" : "на проверке";
+          return '<div class="lk-h ' + cls + '"><i>' + lbl + '</i>' +
+            '<span>' + E(s[1]) + ' · ' + r.from_ayah + '–' + r.to_ayah + '</span></div>';
+        }).join("") + '</div>' : "") +
+    '</div>';
+  }
+
+  function paint() {
+    var host = document.getElementById("lkBox");
+    if (!host) return;
+    var html = staff() ? staffBlock() : studentBlock();
+    if (html === L.last) return;
+    L.last = html;
+    host.innerHTML = html;
+  }
+
+  function mount() {
+    var m = mem(); if (!m) return;
+    var view = "";
+    try { view = ui.view; } catch (e) {}
+    var want = staff() ? (view === "team") : (view === "requests");
+    var main = document.getElementById("main") || document.querySelector("main");
+    if (!main) return;
+    var box = document.getElementById("lkBox");
+    if (!want) { if (box) box.remove(); return; }
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "lkBox";
+      main.insertBefore(box, main.firstChild);
+      L.last = "";
+      paint();
+      load().then(function () { L.last = ""; paint(); });
+      return;
+    }
+    paint();
+  }
+
+  if (!document.getElementById("lk-css")) {
+    var st = document.createElement("style");
+    st.id = "lk-css";
+    st.textContent = [
+      "#lkBox{margin-bottom:18px}",
+      ".lk-shell{--k:#6a5ae0;--k2:#0d94b4;--ok:#1e8e52;--bad:#cf3d3d;--warn:#b97708;",
+      "  border-radius:17px;padding:17px;position:relative;overflow:hidden;",
+      "  border:1px solid color-mix(in srgb,var(--k) 26%,var(--line));",
+      "  background:linear-gradient(150deg,color-mix(in srgb,var(--k) 9%,var(--surface)),var(--surface))}",
+      ".lk-shell.ok{--k:#1e8e52}.lk-shell.warn{--k:#b97708}",
+      "[data-theme='dark'] .lk-shell{--k:#9a8cff;--k2:#3ec6dd;--ok:#4cc38a;--bad:#f06a6a;--warn:#e0a232}",
+      "[data-theme='dark'] .lk-shell.ok{--k:#4cc38a}[data-theme='dark'] .lk-shell.warn{--k:#e0a232}",
+      ".lk-shell::after{content:'';position:absolute;right:-50px;top:-50px;width:170px;height:170px;border-radius:50%;",
+      "  background:radial-gradient(circle,color-mix(in srgb,var(--k2) 20%,transparent),transparent 70%);pointer-events:none}",
+      ".lk-head{display:flex;align-items:center;gap:12px;margin-bottom:13px;position:relative}",
+      ".lk-led{width:10px;height:10px;border-radius:50%;background:var(--k);flex:none;",
+      "  box-shadow:0 0 0 4px color-mix(in srgb,var(--k) 18%,transparent)}",
+      ".lk-shell.warn .lk-led{animation:lkBeat 1.6s ease-in-out infinite}",
+      "@keyframes lkBeat{50%{opacity:.35;transform:scale(.8)}}",
+      ".lk-t{flex:1;min-width:0}",
+      ".lk-t b{display:block;font-size:15px;font-weight:800;letter-spacing:-.2px}",
+      ".lk-t small{display:block;font-size:11.5px;font-weight:700;color:var(--k);margin-top:2px}",
+      ".lk-snd{width:30px;height:30px;border-radius:9px;border:1px solid var(--line2);background:var(--surface);cursor:pointer;font-size:12px}",
+      ".lk-tools{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:11px}",
+      ".lk-search{flex:2;min-width:150px;font:inherit;font-size:12.5px;font-weight:600;padding:8px 11px;",
+      "  min-height:38px;border-radius:10px;border:1px solid var(--line2);background:var(--surface);color:var(--ink)}",
+      ".lk-search:focus{outline:none;border-color:var(--k);box-shadow:0 0 0 3px color-mix(in srgb,var(--k) 16%,transparent)}",
+      ".lk-tg{display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:11.5px;font-weight:800;",
+      "  border:1px solid var(--line2);background:var(--surface);padding:7px 11px;border-radius:10px}",
+      ".lk-tg input{position:absolute;opacity:0;width:1px;height:1px;min-height:0}",
+      ".lk-tg i{width:30px;height:17px;border-radius:9px;background:var(--line2);position:relative;transition:.2s;flex:none}",
+      ".lk-tg i::after{content:'';position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;transition:.2s}",
+      ".lk-tg input:checked+i{background:linear-gradient(135deg,var(--k),var(--k2))}",
+      ".lk-tg input:checked+i::after{transform:translateX(13px)}",
+      ".lk-tool{border:1px solid var(--line2);background:var(--surface);cursor:pointer;font:inherit;font-weight:800;",
+      "  font-size:12px;padding:7px 12px;border-radius:10px;color:var(--ink)}",
+      ".lk-tool:hover{border-color:var(--k);color:var(--k)}",
+      ".lk-list{display:flex;flex-direction:column;gap:7px;max-height:340px;overflow-y:auto;padding-right:3px}",
+      ".lk-list{scrollbar-width:thin;scrollbar-color:var(--k) var(--surface3)}",
+      ".lk-list::-webkit-scrollbar{width:9px}",
+      ".lk-list::-webkit-scrollbar-track{background:var(--surface3);border-radius:7px}",
+      ".lk-list::-webkit-scrollbar-thumb{background:linear-gradient(180deg,var(--k),var(--k2));border-radius:7px;border:2px solid var(--surface3)}",
+      ".lk-row{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:12px;",
+      "  background:var(--surface);border:1px solid var(--line)}",
+      ".lk-row.off{border-color:color-mix(in srgb,var(--warn) 34%,var(--line))}",
+      ".lk-av{width:32px;height:32px;border-radius:10px;flex:none;display:grid;place-items:center;position:relative;",
+      "  background:linear-gradient(135deg,var(--k),var(--k2));color:#fff;font-weight:800;font-size:11.5px}",
+      ".lk-av i{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;",
+      "  border:2px solid var(--surface);background:var(--faint)}",
+      ".lk-row.on .lk-av i{background:var(--ok)}",
+      ".lk-row.off .lk-av i{background:var(--warn)}",
+      ".lk-who{flex:1;min-width:0}",
+      ".lk-who b{display:block;font-size:12.5px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".lk-who small{display:block;font-size:10.5px;font-weight:600;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".lk-sel{flex:1;min-width:130px;max-width:210px;font:inherit;font-size:12px;font-weight:700;padding:7px 9px;",
+      "  min-height:36px;border-radius:10px;border:1px solid var(--line2);background:var(--surface2);color:var(--ink)}",
+      ".lk-sel:focus{outline:none;border-color:var(--k)}",
+      ".lk-x{width:28px;height:28px;border-radius:8px;border:1px solid var(--line2);background:var(--surface2);",
+      "  cursor:pointer;color:var(--bad);font-size:11px;flex:none}",
+      ".lk-x:hover{border-color:var(--bad)}",
+      ".lk-empty{padding:16px;text-align:center;font-size:12px;font-weight:600;color:var(--muted);",
+      "  border:1px dashed var(--line2);border-radius:12px}",
+      ".lk-note{margin-top:11px;font-size:11.5px;font-weight:600;line-height:1.6;color:var(--muted)}",
+      ".lk-pick{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:12px}",
+      ".lk-card{display:flex;align-items:center;gap:10px;padding:11px;border-radius:13px;cursor:pointer;",
+      "  border:1px solid var(--line2);background:var(--surface);font:inherit;text-align:left;transition:.15s}",
+      ".lk-card:hover:not(:disabled){border-color:var(--k);transform:translateY(-2px);box-shadow:0 6px 18px color-mix(in srgb,var(--k) 20%,transparent)}",
+      ".lk-card:disabled{opacity:.5}",
+      ".lk-card b{display:block;font-size:12.5px;font-weight:800}",
+      ".lk-card small{display:block;font-size:10.5px;font-weight:600;color:var(--muted)}",
+      ".lk-form{display:flex;flex-direction:column;gap:11px}",
+      ".lk-f{display:flex;flex-direction:column;gap:5px}",
+      ".lk-f>span{font-size:11px;font-weight:800;color:var(--muted)}",
+      ".lk-f select,.lk-f input{font:inherit;font-size:13px;font-weight:600;padding:9px 11px;min-height:42px;",
+      "  border-radius:11px;border:1px solid var(--line2);background:var(--surface);color:var(--ink)}",
+      ".lk-f select:focus,.lk-f input:focus{outline:none;border-color:var(--k);box-shadow:0 0 0 3px color-mix(in srgb,var(--k) 15%,transparent)}",
+      ".lk-range{display:flex;gap:10px}.lk-range .lk-f{flex:1}",
+      ".lk-step{display:flex;align-items:center;gap:5px}",
+      ".lk-step input{flex:1;min-width:0;text-align:center;font-weight:800}",
+      ".lk-step button{width:34px;height:42px;border-radius:10px;border:1px solid var(--line2);",
+      "  background:var(--surface2);cursor:pointer;font-weight:800;font-size:15px;color:var(--ink);flex:none}",
+      ".lk-step button:hover{border-color:var(--k);color:var(--k)}",
+      ".lk-hint{font-size:11px;font-weight:700;color:var(--k)}",
+      ".lk-main{border:0;cursor:pointer;font:inherit;font-weight:800;font-size:14px;min-height:48px;border-radius:13px;",
+      "  background:linear-gradient(135deg,var(--k),var(--k2));color:#fff;",
+      "  box-shadow:0 8px 22px color-mix(in srgb,var(--k) 32%,transparent);transition:.15s}",
+      ".lk-main:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}",
+      ".lk-main:disabled{opacity:.5;cursor:not-allowed}",
+      ".lk-hist{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}",
+      ".lk-hist>b{display:block;font-size:10.5px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}",
+      ".lk-h{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:9px;background:var(--surface2);margin-bottom:4px}",
+      ".lk-h i{font-style:normal;font-size:9.5px;font-weight:800;padding:2px 7px;border-radius:6px;flex:none}",
+      ".lk-h.ok i{background:color-mix(in srgb,var(--ok) 16%,var(--surface));color:var(--ok)}",
+      ".lk-h.bad i{background:color-mix(in srgb,var(--bad) 16%,var(--surface));color:var(--bad)}",
+      ".lk-h.wait i{background:color-mix(in srgb,var(--warn) 16%,var(--surface));color:var(--warn)}",
+      ".lk-h span{font-size:11.5px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      "@media(max-width:600px){.lk-row{flex-wrap:wrap}.lk-sel{max-width:none;width:100%}.lk-range{flex-direction:column}}",
+      "@media(prefers-reduced-motion:reduce){.lk-shell *{animation:none!important}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  document.addEventListener("click", async function (e) {
+    var t = e.target.closest("[data-lk]");
+    if (!t) return;
+    var a = t.dataset.lk;
+    if (a === "sel" || a === "surah" || a === "q" || a === "note" || a === "from" || a === "to" || a === "free") return;
+    e.preventDefault(); e.stopPropagation();
+
+    if (a === "sound") { L.sound = !L.sound; if (L.sound) sfx("tap"); L.last = ""; paint(); return; }
+    if (a === "refresh") { L.busy = true; L.last = ""; paint(); await load(); L.busy = false; L.last = ""; paint(); sfx("tap"); return; }
+    if (a === "unlink") { await doUnlink(t.dataset.user); return; }
+    if (a === "claim") { await doLink(L.me.user_id, t.dataset.card); return; }
+    if (a === "submit") { await submit(); return; }
+    if (a === "step") {
+      var f = t.dataset.f, d = Number(t.dataset.d || 0);
+      var max = surahOf(L.surah)[3] || 286;
+      L[f] = Math.min(max, Math.max(1, L[f] + d));
+      if (L.to < L.from) L.to = L.from;
+      L.last = ""; paint(); sfx("tap"); return;
+    }
+  }, true);
+
+  document.addEventListener("change", async function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.lk) return;
+    var a = el.dataset.lk;
+    if (a === "sel") {
+      var uid = el.dataset.user, val = el.value;
+      if (!val) await doUnlink(uid);
+      else await doLink(uid, val);
+      return;
+    }
+    if (a === "surah") {
+      L.surah = Number(el.value) || 1;
+      var mx = surahOf(L.surah)[3] || 286;
+      L.from = 1; L.to = Math.min(7, mx);
+      L.last = ""; paint(); sfx("tap"); return;
+    }
+    if (a === "from" || a === "to") {
+      var m2 = surahOf(L.surah)[3] || 286;
+      L[a] = Math.min(m2, Math.max(1, Number(el.value) || 1));
+      if (L.to < L.from) L.to = L.from;
+      L.last = ""; paint(); return;
+    }
+    if (a === "free") { L.onlyFree = el.checked; L.last = ""; paint(); sfx("tap"); return; }
+  }, true);
+
+  document.addEventListener("input", function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.lk) return;
+    if (el.dataset.lk === "q") { L.q = el.value; L.last = ""; paint(); }
+    if (el.dataset.lk === "note") { L.note = el.value; }
+  }, true);
+
+  if (typeof window.renderView === "function" && !window.renderView.__lkWrapped) {
+    var _rv = window.renderView;
+    var w = function () { var r = _rv.apply(this, arguments); setTimeout(mount, 40); return r; };
+    w.__lkWrapped = true;
+    window.renderView = w;
+  }
+  if (typeof window.go === "function" && !window.go.__lkWrapped) {
+    var _g = window.go;
+    var g = function () { var r = _g.apply(this, arguments); setTimeout(mount, 300); return r; };
+    g.__lkWrapped = true;
+    window.go = g;
+  }
+
+  window.HifzLink = { mount: mount, reload: function () { return load().then(paint); } };
+  setTimeout(mount, 1200);
+})();
+       </script>
 </body>
    </html>
