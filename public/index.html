@@ -9704,5 +9704,80 @@ initCloud();
   setTimeout(mount, 1200);
 })();
        </script>
+   <script>
+/* ==========================================================
+   УДАЛЕНИЕ ЛИШНИХ ПАНЕЛЕЙ ПРИВЯЗКИ И ЗАЯВОК
+   Вставить перед </body>. Убирает lkBox / lnkBox и их стили,
+   штатные блоки журнала остаются нетронутыми.
+   Либо просто удали из index.html два блока
+   "LINKING + REQUESTS" и "ПРИВЯЗКА + ЗАЯВКИ" — эффект тот же.
+   ========================================================== */
+(function () {
+  if (window.__hifzPanelCleanup) return;
+  window.__hifzPanelCleanup = true;
+
+  var IDS = ["lkBox", "lnkBox"];
+  var CSS = ["lk-css", "lnk-css"];
+
+  if (!document.getElementById("hifz-panel-cleanup")) {
+    var st = document.createElement("style");
+    st.id = "hifz-panel-cleanup";
+    st.textContent = "#lkBox,#lnkBox{display:none!important;height:0!important;margin:0!important;padding:0!important;overflow:hidden!important}";
+    document.head.appendChild(st);
+  }
+
+  function sweep() {
+    for (var i = 0; i < CSS.length; i++) {
+      var s = document.getElementById(CSS[i]);
+      if (s) s.remove();
+    }
+    for (var j = 0; j < IDS.length; j++) {
+      var el = document.getElementById(IDS[j]);
+      if (el) el.remove();
+    }
+  }
+
+  function sweepBurst() {
+    sweep();
+    requestAnimationFrame(sweep);
+    setTimeout(sweep, 60);
+    setTimeout(sweep, 320);
+    setTimeout(sweep, 1300);
+    setTimeout(sweep, 1700);
+  }
+
+  if (window.HifzLink) { try { window.HifzLink.mount = function () {}; window.HifzLink.reload = function () { return Promise.resolve(); }; } catch (e) {} }
+  if (window.HifzLinkPlain) { try { window.HifzLinkPlain.mount = function () {}; window.HifzLinkPlain.reload = function () { return Promise.resolve(); }; } catch (e) {} }
+
+  if (typeof window.renderView === "function" && !window.renderView.__clWrapped) {
+    var _rv = window.renderView;
+    var rv = function () { var r = _rv.apply(this, arguments); sweepBurst(); return r; };
+    rv.__clWrapped = true;
+    window.renderView = rv;
+  }
+
+  if (typeof window.go === "function" && !window.go.__clWrapped) {
+    var _g = window.go;
+    var g = function () { var r = _g.apply(this, arguments); sweepBurst(); return r; };
+    g.__clWrapped = true;
+    window.go = g;
+  }
+
+  if (typeof window.renderAll === "function" && !window.renderAll.__clWrapped) {
+    var _ra = window.renderAll;
+    var ra = function () { var r = _ra.apply(this, arguments); sweepBurst(); return r; };
+    ra.__clWrapped = true;
+    window.renderAll = ra;
+  }
+
+  sweepBurst();
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", sweepBurst, { once: true });
+  }
+  window.addEventListener("load", sweepBurst, { once: true });
+
+  window.HifzPanelCleanup = { sweep: sweepBurst };
+})();
+   </script>
 </body>
    </html>
