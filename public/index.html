@@ -9779,5 +9779,291 @@ initCloud();
   window.HifzPanelCleanup = { sweep: sweepBurst };
 })();
    </script>
+   <script>
+/* ==========================================================
+   МОДЕРАЦИЯ · кнопки «Навсегда» и «Удалить» рядом с «Исключить»
+   Вставить перед </body>. Стиль — как в журнале, без панелей.
+   ========================================================== */
+(function () {
+  if (window.__hifzModeration) return;
+  window.__hifzModeration = true;
+
+  var M = { members: [], bans: [], busy: false, job: null, word: "", reason: "", drop: false, last: "" };
+
+  function E(s) { try { return esc(s); } catch (e) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); } }
+  function mem() { try { return typeof member !== "undefined" ? member : null; } catch (e) { return null; } }
+  function own() { try { return typeof isOwner === "function" && isOwner(); } catch (e) { return false; } }
+  function say(m, t) { try { toast(m, { type: t || "success" }); } catch (e) {} }
+
+  function errText(e) {
+    var s = String((e && e.message) || e || "");
+    if (/FORBIDDEN/.test(s)) return "Только владелец может это делать";
+    if (/SELF_ACTION/.test(s)) return "Нельзя применить к себе";
+    if (/OWNER_PROTECTED/.test(s)) return "Владельца удалить нельзя";
+    if (/PERMANENT_BAN/.test(s)) return "Бан вечный, снятие только через SQL";
+    if (/NO_MEMBER/.test(s)) return "Участник не найден";
+    if (/BAD_CONFIRM/.test(s)) return "Неверное кодовое слово";
+    try { return humanError(e); } catch (x) { return s; }
+  }
+
+  async function load() {
+    if (!own()) return;
+    try {
+      var r = await rpc("hifz_moderation_state");
+      if (r.error) return;
+      M.members = (r.data && r.data.members) || [];
+      M.bans = (r.data && r.data.bans) || [];
+    } catch (e) {}
+  }
+
+  function memberOf(id) {
+    return M.members.find(function (m) { return m.user_id === id; }) || null;
+  }
+  function isPermanent(id) {
+    var m = memberOf(id);
+    return M.bans.some(function (b) {
+      return b.permanent && (b.user_id === id || (m && b.email && b.email === m.email));
+    });
+  }
+
+  /* ---------- диалог ---------- */
+  function root() {
+    var r = document.getElementById("mdRoot");
+    if (!r) { r = document.createElement("div"); r.id = "mdRoot"; document.body.appendChild(r); }
+    return r;
+  }
+
+  function close() {
+    M.job = null; M.word = ""; M.reason = ""; M.drop = false;
+    root().innerHTML = "";
+    document.body.style.overflow = "";
+    document.removeEventListener("keydown", onKey, true);
+  }
+
+  function onKey(e) {
+    if (!M.job) return;
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+  }
+
+  function open(mode, id) {
+    var m = memberOf(id);
+    var me = mem();
+    if (!m) { say("Участник не найден", "danger"); return; }
+    if (me && id === me.user_id) { say("Нельзя применить к себе", "danger"); return; }
+    if (m.role === "owner") { say("Владельца удалить нельзя", "danger"); return; }
+
+    M.job = { mode: mode, id: id, m: m };
+    M.word = ""; M.reason = ""; M.drop = false;
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", onKey, true);
+    paintModal();
+    setTimeout(function () {
+      var f = root().querySelector("[data-md='reason']");
+      if (f) f.focus();
+    }, 60);
+  }
+
+  function paintModal() {
+    if (!M.job) return;
+    var forever = M.job.mode === "ban";
+    var m = M.job.m;
+    var ready = !forever || M.word.trim().toUpperCase() === "НАВСЕГДА";
+
+    root().innerHTML =
+      '<div class="md-back" data-md="back">' +
+        '<div class="md-box" role="dialog" aria-modal="true">' +
+          '<h3>' + (forever ? "Исключить навсегда" : "Удалить участника") + '</h3>' +
+          '<div class="md-who">' +
+            '<span class="avatar sm">' + E((m.name || m.email || "?").slice(0, 2).toUpperCase()) + '</span>' +
+            '<span class="md-who-t"><b>' + E(m.name || m.email || "Участник") + '</b>' +
+              '<small>' + E(m.email || "") + " · " + (m.role === "teacher" ? "учитель" : "ученица") + '</small></span>' +
+          '</div>' +
+          '<p class="md-text">' + (forever
+            ? "Доступ закрывается permanently: запись в бане помечается как вечная, участник удаляется из журнала. Снять бан из интерфейса будет нельзя — только владельцу через SQL с кодовым словом."
+            : "Участник убирается из журнала. Бан не ставится — он сможет вернуться по новому приглашению. Прогресс ученицы в журнале остаётся.") + '</p>' +
+          (forever
+            ? '<label class="md-field">Причина<textarea data-md="reason" rows="2" maxlength="240" placeholder="Необязательно, попадёт в запись бана">' + E(M.reason) + '</textarea></label>' +
+              (m.student_id
+                ? '<label class="md-chk"><input type="checkbox" data-md="drop"' + (M.drop ? " checked" : "") + '>' +
+                  '<span>Удалить также карточку ученицы, её отрывки и историю повторений</span></label>'
+                : "") +
+              '<label class="md-field">Для подтверждения введи <b>НАВСЕГДА</b>' +
+                '<input data-md="word" autocomplete="off" spellcheck="false" value="' + E(M.word) + '" placeholder="НАВСЕГДА">' +
+              '</label>'
+            : "") +
+          '<div class="md-actions">' +
+            '<button class="btn ghost" data-md="cancel">Отмена</button>' +
+            '<button class="btn ' + (forever ? "danger" : "soft") + '" data-md="go"' + (ready && !M.busy ? "" : " disabled") + '>' +
+              (M.busy ? "Выполняем…" : forever ? "Исключить навсегда" : "Удалить") + '</button>' +
+          '</div>' +
+          '<p class="md-hint">Esc — отмена</p>' +
+        '</div>' +
+      '</div>';
+  }
+
+  async function execute() {
+    if (!M.job || M.busy) return;
+    var job = M.job;
+    M.busy = true; paintModal();
+    try {
+      var r = job.mode === "ban"
+        ? await rpc("hifz_ban_forever", { p_user: job.id, p_reason: M.reason || null, p_drop_student: !!M.drop })
+        : await rpc("hifz_remove_member", { p_user: job.id });
+      if (r.error) throw r.error;
+      close();
+      say(job.mode === "ban" ? "Исключён навсегда" : "Участник удалён", job.mode === "ban" ? "danger" : "info");
+      await load();
+      try { if (typeof loadTeam === "function") await loadTeam(); } catch (e) {}
+      try { if (typeof renderAll === "function") renderAll(); } catch (e) {}
+      decorate();
+    } catch (e) {
+      say(errText(e), "danger");
+      M.busy = false; paintModal();
+      return;
+    }
+    M.busy = false;
+  }
+
+  /* ---------- кнопки в существующих строках ---------- */
+  function decorate() {
+    if (!own()) return;
+
+    var kicks = document.querySelectorAll('[data-action="kick-member"]');
+    for (var i = 0; i < kicks.length; i++) {
+      var btn = kicks[i];
+      var id = btn.dataset.id;
+      if (!id) continue;
+      var host = btn.parentElement;
+      if (!host || host.querySelector("[data-md='ban']")) continue;
+      var m = memberOf(id);
+      if (!m || m.role === "owner") continue;
+      var me = mem();
+      if (me && id === me.user_id) continue;
+
+      var wrap = document.createElement("span");
+      wrap.className = "md-inline";
+      wrap.innerHTML =
+        '<button class="btn ghost sm md-b" data-md="ban" data-id="' + E(id) + '" title="Вечный бан, снять из интерфейса нельзя">Навсегда</button>' +
+        '<button class="btn ghost sm md-b" data-md="del" data-id="' + E(id) + '" title="Убрать из журнала без бана">Удалить</button>';
+      btn.insertAdjacentElement("afterend", wrap);
+    }
+
+    var unbans = document.querySelectorAll('[data-action="unban-member"]');
+    for (var j = 0; j < unbans.length; j++) {
+      var ub = unbans[j];
+      var uid = ub.dataset.id || ub.dataset.user || "";
+      var row = ub.closest("tr, .member-row, .ban-row, li, .card") || ub.parentElement;
+      var email = "";
+      if (row) {
+        var t = row.textContent || "";
+        var mm = t.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+        if (mm) email = mm[0];
+      }
+      var perm = M.bans.some(function (b) {
+        return b.permanent && ((uid && b.user_id === uid) || (email && b.email === email));
+      });
+      if (perm) {
+        ub.disabled = true;
+        ub.classList.add("md-locked");
+        ub.title = "Вечный бан — снятие только через SQL";
+        ub.textContent = "навсегда";
+      }
+    }
+  }
+
+  function refresh() {
+    load().then(decorate);
+  }
+
+  /* ---------- стили в языке журнала ---------- */
+  if (!document.getElementById("md-css")) {
+    var st = document.createElement("style");
+    st.id = "md-css";
+    st.textContent = [
+      ".md-inline{display:inline-flex;gap:6px;margin-left:6px;vertical-align:middle}",
+      ".md-b{white-space:nowrap}",
+      ".md-b[data-md='ban']:hover{border-color:var(--red);color:var(--red);background:var(--red-soft)}",
+      ".md-locked{opacity:.55;cursor:not-allowed}",
+      ".md-back{position:fixed;inset:0;z-index:920;display:grid;place-items:center;padding:18px;",
+      "  background:rgba(10,16,24,.5);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}",
+      ".md-box{width:100%;max-width:430px;max-height:88vh;overflow-y:auto;background:var(--surface);",
+      "  border:1px solid var(--line);border-radius:16px;padding:22px;box-shadow:0 20px 50px rgba(10,16,24,.28)}",
+      ".md-box{scrollbar-width:thin;scrollbar-color:var(--line2) var(--surface2)}",
+      ".md-box::-webkit-scrollbar{width:10px}",
+      ".md-box::-webkit-scrollbar-track{background:var(--surface2);border-radius:8px}",
+      ".md-box::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px;border:2px solid var(--surface2)}",
+      ".md-box::-webkit-scrollbar-thumb:hover{background:var(--muted)}",
+      ".md-box h3{font-size:17px;font-weight:800;letter-spacing:-.2px;margin-bottom:13px}",
+      ".md-who{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:11px;",
+      "  background:var(--surface2);border:1px solid var(--line);margin-bottom:12px}",
+      ".md-who-t{min-width:0}",
+      ".md-who-t b{display:block;font-size:13px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      ".md-who-t small{display:block;font-size:11px;font-weight:600;color:var(--muted);margin-top:1px}",
+      ".md-text{font-size:12.5px;font-weight:500;line-height:1.6;color:var(--muted);margin-bottom:14px}",
+      ".md-field{display:block;margin-bottom:13px;font-size:11.5px;font-weight:700;color:var(--muted)}",
+      ".md-field b{color:var(--red);letter-spacing:.6px}",
+      ".md-field input,.md-field textarea{display:block;width:100%;margin-top:6px;font:inherit;font-size:13px;",
+      "  font-weight:600;padding:10px 12px;border-radius:11px;border:1px solid var(--line2);",
+      "  background:var(--surface2);color:var(--ink);resize:none}",
+      ".md-field input:focus,.md-field textarea:focus{outline:none;border-color:var(--blue);background:var(--surface)}",
+      ".md-chk{display:flex;align-items:flex-start;gap:9px;margin-bottom:13px;font-size:12px;font-weight:600;",
+      "  line-height:1.5;color:var(--muted);cursor:pointer}",
+      ".md-chk input{width:16px;height:16px;min-height:0;margin-top:1px;accent-color:var(--red);flex:none}",
+      ".md-actions{display:flex;gap:9px}",
+      ".md-actions .btn{flex:1}",
+      ".md-hint{margin-top:11px;text-align:center;font-size:11px;font-weight:600;color:var(--faint)}",
+      "@media(max-width:560px){.md-inline{display:flex;margin:6px 0 0}.md-inline .btn{flex:1}}"
+    ].join("\n");
+    document.head.appendChild(st);
+  }
+
+  /* ---------- события ---------- */
+  document.addEventListener("click", function (e) {
+    var t = e.target.closest("[data-md]");
+    if (!t) return;
+    var a = t.dataset.md;
+    if (a === "reason" || a === "word" || a === "drop") return;
+    e.preventDefault(); e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+
+    if (a === "ban") { open("ban", t.dataset.id); return; }
+    if (a === "del") { open("del", t.dataset.id); return; }
+    if (a === "cancel") { close(); return; }
+    if (a === "back") { if (e.target === t) close(); return; }
+    if (a === "go") { execute(); return; }
+  }, true);
+
+  document.addEventListener("input", function (e) {
+    var el = e.target;
+    if (!el.dataset || !el.dataset.md) return;
+    if (el.dataset.md === "reason") { M.reason = el.value; return; }
+    if (el.dataset.md === "word") {
+      M.word = el.value;
+      var btn = root().querySelector("[data-md='go']");
+      if (btn) btn.disabled = M.word.trim().toUpperCase() !== "НАВСЕГДА" || M.busy;
+      return;
+    }
+  }, true);
+
+  document.addEventListener("change", function (e) {
+    var el = e.target;
+    if (el.dataset && el.dataset.md === "drop") M.drop = el.checked;
+  }, true);
+
+  function hook(name) {
+    var f = window[name];
+    if (typeof f !== "function" || f.__mdWrapped) return;
+    var w = function () { var r = f.apply(this, arguments); setTimeout(refresh, 60); setTimeout(decorate, 340); return r; };
+    w.__mdWrapped = true;
+    window[name] = w;
+  }
+  hook("renderView");
+  hook("renderAll");
+  hook("go");
+
+  window.HifzModeration = { refresh: refresh, open: open };
+  setTimeout(refresh, 1200);
+})();
+       </script>
 </body>
    </html>
